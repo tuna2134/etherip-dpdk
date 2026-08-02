@@ -1,12 +1,21 @@
-#include <stddef.h>
 #include <stdint.h>
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_ether.h>
+#include <rte_lcore.h>
+#include <rte_mbuf.h>
 #include <rte_mempool.h>
 
-int dpdk_eal_init(int argc, char **argv);
-unsigned dpdk_port_count(void);
-struct rte_mempool *dpdk_pool_create(const char *name, unsigned count);
-int dpdk_port_open(uint16_t port, struct rte_mempool *pool);
-int dpdk_port_mac(uint16_t port, uint8_t mac[6]);
-uint16_t dpdk_receive(uint16_t port, uint8_t *data, uint16_t capacity);
-int dpdk_send(uint16_t port, struct rte_mempool *pool, const uint8_t *data, uint16_t length);
-void dpdk_port_close(uint16_t port);
+uint16_t dpdk_rx_burst(uint16_t port, uint16_t queue,
+                       struct rte_mbuf **packets, uint16_t count);
+uint16_t dpdk_tx_burst(uint16_t port, uint16_t queue,
+                       struct rte_mbuf **packets, uint16_t count);
+struct rte_mbuf *dpdk_pktmbuf_alloc(struct rte_mempool *pool);
+void dpdk_pktmbuf_free(struct rte_mbuf *packet);
+void *dpdk_pktmbuf_append(struct rte_mbuf *packet, uint16_t length);
+void *dpdk_pktmbuf_prepend(struct rte_mbuf *packet, uint16_t length);
+void *dpdk_pktmbuf_adj(struct rte_mbuf *packet, uint16_t length);
+void *dpdk_mbuf_data(struct rte_mbuf *packet);
+uint32_t dpdk_mbuf_packet_length(const struct rte_mbuf *packet);
+uint16_t dpdk_mbuf_data_length(const struct rte_mbuf *packet);
+uint16_t dpdk_mbuf_segment_count(const struct rte_mbuf *packet);

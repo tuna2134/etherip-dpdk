@@ -1,5 +1,5 @@
 use clap::Parser;
-use dpdk::Environment;
+use dpdk::{Environment, MempoolConfig, Packet, Port, PortConfig};
 use std::{
     collections::HashMap,
     env, io,
@@ -44,39 +44,101 @@ struct Config {
     /// Outer IPv6 MTU. Larger EtherIP payloads use IPv6 fragments.
     #[arg(long, default_value_t = 1500, value_parser = parse_mtu)]
     mtu: usize,
+
+    /// RX queue used on both ports.
+    #[arg(long, default_value_t = 0)]
+    rx_queue: u16,
+
+    /// TX queue used on both ports.
+    #[arg(long, default_value_t = 0)]
+    tx_queue: u16,
+
+    /// RX descriptors allocated per port.
+    #[arg(long, default_value_t = 1024, value_parser = parse_nonzero_u16)]
+    rx_descriptors: u16,
+
+    /// TX descriptors allocated per port.
+    #[arg(long, default_value_t = 1024, value_parser = parse_nonzero_u16)]
+    tx_descriptors: u16,
+
+    /// NUMA socket for the mempool and queues; DPDK chooses it when omitted.
+    #[arg(long)]
+    socket_id: Option<u32>,
+
+    /// Number of packets requested from each RX burst (multiple of 8).
+    #[arg(long, default_value_t = 32, value_parser = parse_burst_size)]
+    burst_size: u16,
 }
 
 fn main() -> io::Result<()> {
     let args: Vec<_> = env::args().collect();
     let (eal_args, app_args) = split_args(&args);
     let config = Config::parse_from(app_args);
-    let (dpdk, _) = Environment::init(&eal_args)?;
-    let lan = dpdk.open(config.lan)?;
-    let wan = dpdk.open(config.wan)?;
+    let (dpdk, _) = Environment::init_with_config(
+        &eal_args,
+        MempoolConfig {
+            socket_id: config
+                .socket_id
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "socket ID exceeds i32")
+                })?,
+            ..MempoolConfig::default()
+        },
+    )?;
+    let port_config = PortConfig {
+        rx_queue: config.rx_queue,
+        tx_queue: config.tx_queue,
+        rx_descriptors: config.rx_descriptors,
+        tx_descriptors: config.tx_descriptors,
+        socket_id: config.socket_id,
+        ..PortConfig::default()
+    };
+    let lan = dpdk.open_with_config(config.lan, port_config)?;
+    let wan = dpdk.open_with_config(config.wan, port_config)?;
     let wan_mac = wan.mac()?;
     let mut reassembly = Reassembly::default();
     let mut remote_macs = MacTable::default();
     let mut identification = 0u32;
-    let mut buffer = [0u8; MAX_PACKET];
 
     loop {
-        if let Some(length) = lan.receive(&mut buffer)? {
-            let frame = &buffer[..length];
-            if !remote_macs.contains_source(frame) {
-                for packet in encapsulate(frame, &config, wan_mac, &mut identification)? {
-                    wan.send(&packet)?;
-                }
+        let mut tunnel_packets = Vec::new();
+        for packet in lan.receive_burst(config.burst_size)? {
+            let tunnel = packet
+                .data()
+                .is_some_and(|frame| !remote_macs.contains_source(frame));
+            if tunnel {
+                tunnel_packets.extend(encapsulate_packet(
+                    packet,
+                    &dpdk,
+                    &config,
+                    wan_mac,
+                    &mut identification,
+                )?);
             }
         }
-        if let Some(length) = wan.receive(&mut buffer)?
-            && let Some(frame) = decapsulate(&buffer[..length], &config, &mut reassembly)
-        {
-            remote_macs.learn_source(&frame);
-            lan.send(&frame)?;
+        transmit(&wan, &mut tunnel_packets)?;
+
+        let mut lan_packets = Vec::new();
+        for packet in wan.receive_burst(config.burst_size)? {
+            if let Some(packet) = decapsulate_packet(packet, &dpdk, &config, &mut reassembly)? {
+                if let Some(frame) = packet.data() {
+                    remote_macs.learn_source(frame);
+                }
+                lan_packets.push(packet);
+            }
         }
+        transmit(&lan, &mut lan_packets)?;
         reassembly.expire();
         remote_macs.expire();
     }
+}
+
+fn transmit(port: &Port, packets: &mut Vec<Packet>) -> io::Result<()> {
+    let sent = port.send_burst(packets)?;
+    packets.drain(..sent);
+    Ok(())
 }
 
 fn split_args(args: &[String]) -> (Vec<String>, Vec<String>) {
@@ -108,7 +170,46 @@ fn parse_mtu(value: &str) -> Result<usize, String> {
         .ok_or_else(|| "MTU must be between 70 and 65575".into())
 }
 
-fn encapsulate(
+fn parse_nonzero_u16(value: &str) -> Result<u16, String> {
+    let value = value.parse().map_err(|_| "value must be an integer")?;
+    (value != 0)
+        .then_some(value)
+        .ok_or_else(|| "value must be greater than zero".into())
+}
+
+fn parse_burst_size(value: &str) -> Result<u16, String> {
+    let value = parse_nonzero_u16(value)?;
+    value
+        .is_multiple_of(8)
+        .then_some(value)
+        .ok_or_else(|| "burst size must be a multiple of 8".into())
+}
+
+fn encapsulate_packet(
+    mut packet: Packet,
+    dpdk: &Environment,
+    config: &Config,
+    source_mac: [u8; 6],
+    id: &mut u32,
+) -> io::Result<Vec<Packet>> {
+    let frame_length = packet
+        .data()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment LAN packet"))?
+        .len();
+    if 40 + ETHERIP_HEADER.len() + frame_length <= config.mtu {
+        let header = packet.prepend(56)?;
+        write_outer_header(header, config, source_mac, NEXT_ETHERIP, frame_length + 2);
+        header[54..56].copy_from_slice(&ETHERIP_HEADER);
+        return Ok(vec![packet]);
+    }
+    let frame = packet.data().expect("packet was checked as contiguous");
+    fragment_packets(frame, config, source_mac, id)?
+        .into_iter()
+        .map(|bytes| dpdk.packet(&bytes))
+        .collect()
+}
+
+fn fragment_packets(
     frame: &[u8],
     config: &Config,
     source_mac: [u8; 6],
@@ -122,15 +223,6 @@ fn encapsulate(
             io::ErrorKind::InvalidInput,
             "EtherIP payload exceeds the IPv6 payload limit",
         ));
-    }
-    let unfragmented = 40 + payload.len();
-    if unfragmented <= config.mtu {
-        return Ok(vec![ipv6_packet(
-            config,
-            source_mac,
-            NEXT_ETHERIP,
-            &payload,
-        )]);
     }
     let chunk = ((config
         .mtu
@@ -164,56 +256,91 @@ fn encapsulate(
 
 fn ipv6_packet(config: &Config, source_mac: [u8; 6], next: u8, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(54 + payload.len());
-    packet.extend_from_slice(&config.next_hop_mac);
-    packet.extend_from_slice(&source_mac);
-    packet.extend_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
-    packet.extend_from_slice(&[0x60, 0, 0, 0]);
-    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    packet.push(next);
-    packet.push(64);
-    packet.extend_from_slice(&config.local_ipv6.octets());
-    packet.extend_from_slice(&config.remote_ipv6.octets());
+    packet.resize(54, 0);
+    write_outer_header(&mut packet, config, source_mac, next, payload.len());
     packet.extend_from_slice(payload);
     packet
 }
 
-fn decapsulate(packet: &[u8], config: &Config, reassembly: &mut Reassembly) -> Option<Vec<u8>> {
-    if packet.len() < 54
-        || u16::from_be_bytes([packet[12], packet[13]]) != ETHER_TYPE_IPV6
-        || packet[14] >> 4 != 6
-    {
-        return None;
+fn write_outer_header(
+    header: &mut [u8],
+    config: &Config,
+    source_mac: [u8; 6],
+    next: u8,
+    payload_length: usize,
+) {
+    header[0..6].copy_from_slice(&config.next_hop_mac);
+    header[6..12].copy_from_slice(&source_mac);
+    header[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
+    header[14..18].copy_from_slice(&[0x60, 0, 0, 0]);
+    header[18..20].copy_from_slice(&(payload_length as u16).to_be_bytes());
+    header[20] = next;
+    header[21] = 64;
+    header[22..38].copy_from_slice(&config.local_ipv6.octets());
+    header[38..54].copy_from_slice(&config.remote_ipv6.octets());
+}
+
+fn decapsulate_packet(
+    mut packet: Packet,
+    dpdk: &Environment,
+    config: &Config,
+    reassembly: &mut Reassembly,
+) -> io::Result<Option<Packet>> {
+    let Some(data) = packet.data() else {
+        return Ok(None);
+    };
+    if !valid_outer_packet(data, config) {
+        return Ok(None);
     }
-    let payload_len = u16::from_be_bytes([packet[18], packet[19]]) as usize;
-    if packet.len() < 54 + payload_len
-        || packet[22..38] != config.remote_ipv6.octets()
-        || packet[38..54] != config.local_ipv6.octets()
-    {
-        return None;
-    }
-    let payload = &packet[54..54 + payload_len];
-    let etherip = match packet[20] {
-        NEXT_ETHERIP => payload.to_vec(),
+    let payload_length = u16::from_be_bytes([data[18], data[19]]) as usize;
+    let payload = &data[54..54 + payload_length];
+    match data[20] {
+        NEXT_ETHERIP if etherip_payload(payload).is_some() => {
+            packet.adjust(56)?;
+            Ok(Some(packet))
+        }
         NEXT_FRAGMENT if payload.len() >= 8 && payload[0] == NEXT_ETHERIP && payload[1] == 0 => {
             let field = u16::from_be_bytes([payload[2], payload[3]]);
             if field & 6 != 0 {
-                return None;
+                return Ok(None);
             }
             let key = (
-                packet[22..38].try_into().ok()?,
-                packet[38..54].try_into().ok()?,
-                u32::from_be_bytes(payload[4..8].try_into().ok()?),
+                data[22..38].try_into().unwrap(),
+                data[38..54].try_into().unwrap(),
+                u32::from_be_bytes(payload[4..8].try_into().unwrap()),
             );
-            reassembly.insert(
+            let Some(etherip) = reassembly.insert(
                 key,
                 (field as usize >> 3) * 8,
                 field & 1 != 0,
                 &payload[8..],
-            )?
+            ) else {
+                return Ok(None);
+            };
+            let Some(frame) = etherip_payload(&etherip) else {
+                return Ok(None);
+            };
+            Ok(Some(dpdk.packet(frame)?))
         }
-        _ => return None,
-    };
-    (etherip.len() >= 2 && etherip[..2] == ETHERIP_HEADER).then(|| etherip[2..].to_vec())
+        _ => Ok(None),
+    }
+}
+
+fn etherip_payload(payload: &[u8]) -> Option<&[u8]> {
+    payload.strip_prefix(&ETHERIP_HEADER)
+}
+
+fn valid_outer_packet(packet: &[u8], config: &Config) -> bool {
+    if packet.len() < 54
+        || u16::from_be_bytes([packet[12], packet[13]]) != ETHER_TYPE_IPV6
+        || packet[14] >> 4 != 6
+    {
+        return false;
+    }
+    let payload_length = u16::from_be_bytes([packet[18], packet[19]]) as usize;
+    packet.len() >= 54 + payload_length
+        && packet[22..38] == config.remote_ipv6.octets()
+        && packet[38..54] == config.local_ipv6.octets()
 }
 
 type FragmentKey = ([u8; 16], [u8; 16], u32);
@@ -357,9 +484,15 @@ mod tests {
             remote_ipv6: Ipv6Addr::from([2; 16]),
             next_hop_mac: [3; 6],
             mtu: 1280,
+            rx_queue: 0,
+            tx_queue: 0,
+            rx_descriptors: 1024,
+            tx_descriptors: 1024,
+            socket_id: None,
+            burst_size: 32,
         };
         let frame = vec![0xa5; 2000];
-        let packets = encapsulate(&frame, &config, [4; 6], &mut 0).unwrap();
+        let packets = fragment_packets(&frame, &config, [4; 6], &mut 0).unwrap();
         let reverse = Config {
             local_ipv6: config.remote_ipv6,
             remote_ipv6: config.local_ipv6,
@@ -368,9 +501,24 @@ mod tests {
         let mut reassembly = Reassembly::default();
         let mut result = None;
         for packet in packets.into_iter().rev() {
-            result = decapsulate(&packet, &reverse, &mut reassembly).or(result);
+            assert!(valid_outer_packet(&packet, &reverse));
+            let payload = &packet[54..];
+            let field = u16::from_be_bytes([payload[2], payload[3]]);
+            let key = (
+                packet[22..38].try_into().unwrap(),
+                packet[38..54].try_into().unwrap(),
+                u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+            );
+            result = reassembly
+                .insert(
+                    key,
+                    (field as usize >> 3) * 8,
+                    field & 1 != 0,
+                    &payload[8..],
+                )
+                .or(result);
         }
-        assert_eq!(result.unwrap(), frame);
+        assert_eq!(etherip_payload(&result.unwrap()).unwrap(), frame);
     }
 
     #[test]
@@ -382,6 +530,12 @@ mod tests {
             remote_ipv6: Ipv6Addr::from([2; 16]),
             next_hop_mac: [3; 6],
             mtu: 1500,
+            rx_queue: 0,
+            tx_queue: 0,
+            rx_descriptors: 1024,
+            tx_descriptors: 1024,
+            socket_id: None,
+            burst_size: 32,
         };
         let mut packet = ipv6_packet(&config, [4; 6], NEXT_ETHERIP, &[0x31, 0, 1]);
         let reverse = Config {
@@ -389,12 +543,10 @@ mod tests {
             remote_ipv6: config.local_ipv6,
             ..config
         };
-        assert!(decapsulate(&packet, &reverse, &mut Reassembly::default()).is_none());
+        assert!(valid_outer_packet(&packet, &reverse));
+        assert!(etherip_payload(&packet[54..]).is_none());
         packet[54] = 0x30;
-        assert_eq!(
-            decapsulate(&packet, &reverse, &mut Reassembly::default()),
-            Some(vec![1])
-        );
+        assert_eq!(etherip_payload(&packet[54..]), Some([1].as_slice()));
     }
 
     #[test]
