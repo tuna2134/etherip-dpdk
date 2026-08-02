@@ -1,5 +1,9 @@
 #include "wrapper.h"
 
+int dpdk_errno(void) {
+    return rte_errno;
+}
+
 uint16_t dpdk_rx_burst(uint16_t port, uint16_t queue,
                        struct rte_mbuf **packets, uint16_t count) {
     return rte_eth_rx_burst(port, queue, packets, count);

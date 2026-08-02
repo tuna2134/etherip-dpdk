@@ -1,11 +1,13 @@
 #include <stdint.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_errno.h>
 #include <rte_ether.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
+int dpdk_errno(void);
 uint16_t dpdk_rx_burst(uint16_t port, uint16_t queue,
                        struct rte_mbuf **packets, uint16_t count);
 uint16_t dpdk_tx_burst(uint16_t port, uint16_t queue,

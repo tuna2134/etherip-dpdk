@@ -101,10 +101,16 @@ fn main() -> io::Result<()> {
     let mut reassembly = Reassembly::default();
     let mut remote_macs = MacTable::default();
     let mut identification = 0u32;
+    let capacity = usize::from(config.burst_size);
+    let mut lan_received = Vec::with_capacity(capacity);
+    let mut wan_received = Vec::with_capacity(capacity);
+    let mut tunnel_packets = Vec::with_capacity(capacity);
+    let mut lan_packets = Vec::with_capacity(capacity);
 
     loop {
-        let mut tunnel_packets = Vec::new();
-        for packet in lan.receive_burst(config.burst_size)? {
+        tunnel_packets.clear();
+        lan.receive_burst_into(&mut lan_received, config.burst_size)?;
+        for packet in lan_received.drain(..) {
             let tunnel = packet
                 .data()
                 .is_some_and(|frame| !remote_macs.contains_source(frame));
@@ -120,8 +126,9 @@ fn main() -> io::Result<()> {
         }
         transmit(&wan, &mut tunnel_packets)?;
 
-        let mut lan_packets = Vec::new();
-        for packet in wan.receive_burst(config.burst_size)? {
+        lan_packets.clear();
+        wan.receive_burst_into(&mut wan_received, config.burst_size)?;
+        for packet in wan_received.drain(..) {
             if let Some(packet) = decapsulate_packet(packet, &dpdk, &config, &mut reassembly)? {
                 if let Some(frame) = packet.data() {
                     remote_macs.learn_source(frame);

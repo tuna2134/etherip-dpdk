@@ -17,6 +17,7 @@ LAN A ─ LAN port [ endpoint A ] WAN port ══ IPv6 ══ WAN port [ endpoin
 - 順不同fragmentの再構成、重複fragmentの破棄、60秒のタイムアウト
 - 対向から学習した送信元MACによる反射ループ抑止（保持時間5分）
 - bindgenでDPDK Cヘッダーから生成したRust FFIと、安全な最小Rust API
+- burst RX/TXと`rte_mbuf`所有権移譲による通常パスのzero-copy転送
 
 ## 必要なもの
 
@@ -133,6 +134,12 @@ EtherIPオプション:
 | `--remote-ipv6 <ADDR>` | yes | 対向EtherIP endpointのIPv6アドレス |
 | `--next-hop-mac <MAC>` | yes | WAN側IPv6 next hopのMACアドレス |
 | `--mtu <BYTES>` | no | 外側IPv6 MTU。既定値1500、範囲70～65575 |
+| `--rx-queue <ID>` | no | 両ポートで使うRX queue。既定値0 |
+| `--tx-queue <ID>` | no | 両ポートで使うTX queue。既定値0 |
+| `--rx-descriptors <N>` | no | queueごとのRX descriptor数。既定値1024 |
+| `--tx-descriptors <N>` | no | queueごとのTX descriptor数。既定値1024 |
+| `--socket-id <ID>` | no | mempoolとqueueのNUMA socket。省略時はDPDKが選択 |
+| `--burst-size <N>` | no | RX burst数。8の倍数、既定値32 |
 
 `--next-hop-mac`には、対向が同一L2セグメントなら対向WANポートのMAC、
 ルーター越しならnext-hopルーターのMACを指定します。本プログラムはNDPや経路探索を
@@ -189,6 +196,11 @@ WANからLAN方向:
 3. EtherIP version 3かつreserved bitsが0であることを検証する。
 4. 内側Ethernetフレームの送信元MACを学習する。
 5. 元のフレームをLANポートへ送信する。
+
+通常パスでは受信した`rte_mbuf`へ外側headerをprepend、または受信headerをadjustし、
+ユーザーバッファへコピーせずburst送信します。IPv6 fragmentの生成と再構成だけは、
+1個のmbufを複数packetへ分割・統合する必要があるためコピーします。TXが受理した
+mbufの所有権はDPDKへ移り、未送信・破棄packetだけをRust側で解放します。
 
 ## ループ抑止とMAC学習
 
@@ -250,8 +262,8 @@ hugepage、実行権限、CPU core指定、NICのdriver binding、使用中のfi
 ```text
 dpdk/
   build.rs       pkg-config、bindgen、C shimのビルド
-  wrapper.h      bindgenへ公開するC API
-  shim.c         DPDK inline APIを包むC shim
+  wrapper.h      DPDK headerと最小C shimの宣言
+  shim.c         bindgenから呼べないmacro/static inlineだけを包むC shim
   src/lib.rs     DPDKの安全なRustラッパー
 etherip/
   src/main.rs    CLI、EtherIP、IPv6 fragment、MAC学習、転送ループ

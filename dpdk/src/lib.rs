@@ -1,6 +1,7 @@
 //! Safe ownership and burst-oriented access to the DPDK C API.
 
 use std::{
+    cell::RefCell,
     ffi::CString,
     io,
     ptr::{self, NonNull},
@@ -96,7 +97,9 @@ impl Environment {
             .collect();
         // SAFETY: every pointer is writable and NUL-terminated for the duration of the call.
         let consumed = unsafe { ffi::rte_eal_init(pointers.len() as i32, pointers.as_mut_ptr()) };
-        check(consumed)?;
+        if consumed < 0 {
+            return Err(last_error());
+        }
 
         let name = CString::new(format!("etherip_{}", std::process::id())).unwrap();
         let socket_id = config.socket_id.unwrap_or_else(|| {
@@ -114,12 +117,10 @@ impl Environment {
                 socket_id,
             )
         };
+        let pool = NonNull::new(pool).ok_or_else(last_error)?;
         Ok((
             Self {
-                pool: Rc::new(Pool(
-                    NonNull::new(pool)
-                        .ok_or_else(|| io::Error::other("mbuf pool creation failed"))?,
-                )),
+                pool: Rc::new(Pool(pool)),
             },
             consumed as usize,
         ))
@@ -207,6 +208,8 @@ impl Environment {
             rx_queue: config.rx_queue,
             tx_queue: config.tx_queue,
             pool: Rc::clone(&self.pool),
+            rx_scratch: RefCell::new(Vec::new()),
+            tx_scratch: RefCell::new(Vec::new()),
         })
     }
 
@@ -220,6 +223,8 @@ pub struct Port {
     rx_queue: u16,
     tx_queue: u16,
     pool: Rc<Pool>,
+    rx_scratch: RefCell<Vec<*mut ffi::rte_mbuf>>,
+    tx_scratch: RefCell<Vec<*mut ffi::rte_mbuf>>,
 }
 
 impl Port {
@@ -232,19 +237,30 @@ impl Port {
     }
 
     pub fn receive_burst(&self, count: u16) -> io::Result<Vec<Packet>> {
+        let mut packets = Vec::with_capacity(usize::from(count));
+        self.receive_burst_into(&mut packets, count)?;
+        Ok(packets)
+    }
+
+    pub fn receive_burst_into(&self, packets: &mut Vec<Packet>, count: u16) -> io::Result<()> {
         validate_burst(count)?;
-        let mut pointers = vec![ptr::null_mut(); usize::from(count)];
+        packets.clear();
+        packets.reserve(usize::from(count));
+        let mut pointers = self.rx_scratch.borrow_mut();
+        pointers.resize(usize::from(count), ptr::null_mut());
         // SAFETY: pointers has count writable entries and the RX queue is configured.
         let received =
             unsafe { ffi::dpdk_rx_burst(self.id, self.rx_queue, pointers.as_mut_ptr(), count) };
-        Ok(pointers
-            .into_iter()
-            .take(usize::from(received))
-            .map(|pointer| Packet {
-                pointer: Some(NonNull::new(pointer).expect("DPDK returned a null mbuf")),
-                _pool: Rc::clone(&self.pool),
-            })
-            .collect())
+        packets.extend(
+            pointers[..usize::from(received)]
+                .iter()
+                .copied()
+                .map(|pointer| Packet {
+                    pointer: Some(NonNull::new(pointer).expect("DPDK returned a null mbuf")),
+                    _pool: Rc::clone(&self.pool),
+                }),
+        );
+        Ok(())
     }
 
     /// Transfers ownership of the successfully transmitted prefix to DPDK.
@@ -258,7 +274,9 @@ impl Port {
         if count == 0 {
             return Ok(0);
         }
-        let mut pointers: Vec<_> = packets.iter().map(Packet::as_ptr).collect();
+        let mut pointers = self.tx_scratch.borrow_mut();
+        pointers.clear();
+        pointers.extend(packets.iter().map(Packet::as_ptr));
         // SAFETY: every pointer is owned by the corresponding Packet until this call succeeds.
         let sent =
             unsafe { ffi::dpdk_tx_burst(self.id, self.tx_queue, pointers.as_mut_ptr(), count) };
@@ -411,4 +429,14 @@ fn check(code: i32) -> io::Result<i32> {
     (code >= 0)
         .then_some(code)
         .ok_or_else(|| io::Error::from_raw_os_error(-code))
+}
+
+fn last_error() -> io::Error {
+    // SAFETY: rte_errno is available after DPDK reported an error.
+    let errno = unsafe { ffi::dpdk_errno() };
+    if errno > 0 {
+        io::Error::from_raw_os_error(errno)
+    } else {
+        io::Error::other("DPDK operation failed without setting rte_errno")
+    }
 }
