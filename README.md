@@ -21,7 +21,7 @@ LAN A ─ LAN port [ endpoint A ] WAN port ══ IPv6 ══ WAN port [ endpoin
 ## 必要なもの
 
 - Linux
-- Rust 1.85以降（edition 2024）
+- Rust 1.88以降（edition 2024）
 - DPDK本体と開発用Cヘッダー
 - `pkg-config`から`libdpdk`を参照できる環境
 - bindgen用のClang/libclang
