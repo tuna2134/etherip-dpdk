@@ -1,0 +1,3 @@
+[workspace]
+members = ["dpdk", "etherip"]
+resolver = "2"
