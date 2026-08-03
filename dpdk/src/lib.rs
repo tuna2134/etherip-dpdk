@@ -251,15 +251,12 @@ impl Port {
         // SAFETY: pointers has count writable entries and the RX queue is configured.
         let received =
             unsafe { ffi::dpdk_rx_burst(self.id, self.rx_queue, pointers.as_mut_ptr(), count) };
-        packets.extend(
-            pointers[..usize::from(received)]
-                .iter()
-                .copied()
-                .map(|pointer| Packet {
-                    pointer: Some(NonNull::new(pointer).expect("DPDK returned a null mbuf")),
-                    _pool: Rc::clone(&self.pool),
-                }),
-        );
+        for &pointer in &pointers[..usize::from(received)] {
+            packets.push(Packet {
+                pointer: Some(NonNull::new(pointer).expect("DPDK returned a null mbuf")),
+                _pool: Rc::clone(&self.pool),
+            });
+        }
         Ok(())
     }
 

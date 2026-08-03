@@ -445,23 +445,13 @@ impl Reassembly {
         }
         partial.fragments.push((offset, data.to_vec()));
         partial.fragments.sort_unstable_by_key(|part| part.0);
-        let total = partial.total?;
-        if partial
+        let end = partial
             .fragments
             .iter()
-            .scan(0, |next, (offset, bytes)| {
-                let contiguous = *offset == *next;
-                *next += bytes.len();
-                Some(contiguous)
-            })
-            .all(|v| v)
-            && partial
-                .fragments
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum::<usize>()
-                == total
-        {
+            .try_fold(0, |next, (offset, bytes)| {
+                (*offset == next).then_some(next + bytes.len())
+            });
+        if let Some(total) = partial.total.filter(|&total| end == Some(total)) {
             let mut result = Vec::with_capacity(total);
             for (_, bytes) in &partial.fragments {
                 result.extend_from_slice(bytes);
@@ -482,22 +472,26 @@ impl Reassembly {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fragmented_round_trip() {
-        let config = Config {
+    fn config(mtu: usize) -> Config {
+        Config {
             lan: 0,
             wan: 1,
             local_ipv6: Ipv6Addr::from([1; 16]),
             remote_ipv6: Ipv6Addr::from([2; 16]),
             next_hop_mac: [3; 6],
-            mtu: 1280,
+            mtu,
             rx_queue: 0,
             tx_queue: 0,
             rx_descriptors: 1024,
             tx_descriptors: 1024,
             socket_id: None,
             burst_size: 32,
-        };
+        }
+    }
+
+    #[test]
+    fn fragmented_round_trip() {
+        let config = config(1280);
         let frame = vec![0xa5; 2000];
         let packets = fragment_packets(&frame, &config, [4; 6], &mut 0).unwrap();
         let reverse = Config {
@@ -530,20 +524,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_etherip_header() {
-        let config = Config {
-            lan: 0,
-            wan: 1,
-            local_ipv6: Ipv6Addr::from([1; 16]),
-            remote_ipv6: Ipv6Addr::from([2; 16]),
-            next_hop_mac: [3; 6],
-            mtu: 1500,
-            rx_queue: 0,
-            tx_queue: 0,
-            rx_descriptors: 1024,
-            tx_descriptors: 1024,
-            socket_id: None,
-            burst_size: 32,
-        };
+        let config = config(1500);
         let mut packet = ipv6_packet(&config, [4; 6], NEXT_ETHERIP, &[0x31, 0, 1]);
         let reverse = Config {
             local_ipv6: config.remote_ipv6,
