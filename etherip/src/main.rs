@@ -8,6 +8,7 @@ use std::{
 };
 
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
+const NEXT_ICMPV6: u8 = 58;
 const NEXT_ETHERIP: u8 = 97;
 const NEXT_FRAGMENT: u8 = 44;
 const ETHERIP_HEADER: [u8; 2] = [0x30, 0];
@@ -106,6 +107,7 @@ fn main() -> io::Result<()> {
     let mut wan_received = Vec::with_capacity(capacity);
     let mut tunnel_packets = Vec::with_capacity(capacity);
     let mut lan_packets = Vec::with_capacity(capacity);
+    let mut diagnostics = Diagnostics::new();
 
     loop {
         tunnel_packets.clear();
@@ -128,18 +130,115 @@ fn main() -> io::Result<()> {
 
         lan_packets.clear();
         wan.receive_burst_into(&mut wan_received, config.burst_size)?;
+        diagnostics.wan_rx += wan_received.len() as u64;
         for packet in wan_received.drain(..) {
-            if let Some(packet) = decapsulate_packet(packet, &dpdk, &config, &mut reassembly)? {
+            if let Some(reply) = packet
+                .data()
+                .and_then(|data| ndp_advertisement(data, &config, wan_mac))
+            {
+                tunnel_packets.push(dpdk.packet(&reply)?);
+                continue;
+            }
+            if let Some(packet) =
+                decapsulate_packet(packet, &dpdk, &config, &mut reassembly, &mut diagnostics)?
+            {
                 if let Some(frame) = packet.data() {
                     remote_macs.learn_source(frame);
                 }
                 lan_packets.push(packet);
             }
         }
+        transmit(&wan, &mut tunnel_packets)?;
+        let queued = lan_packets.len();
         transmit(&lan, &mut lan_packets)?;
+        diagnostics.lan_tx += (queued - lan_packets.len()) as u64;
+        diagnostics.lan_tx_unsent += lan_packets.len() as u64;
+        diagnostics.report();
         reassembly.expire();
         remote_macs.expire();
     }
+}
+
+fn ndp_advertisement(packet: &[u8], config: &Config, local_mac: [u8; 6]) -> Option<Vec<u8>> {
+    const ICMP_OFFSET: usize = 54;
+    const NS_LENGTH: usize = 24;
+    const NA_LENGTH: usize = 32;
+
+    if packet.len() < ICMP_OFFSET + NS_LENGTH
+        || u16::from_be_bytes(packet[12..14].try_into().ok()?) != ETHER_TYPE_IPV6
+        || packet[14] >> 4 != 6
+        || packet[20] != NEXT_ICMPV6
+        || packet[21] != 255
+    {
+        return None;
+    }
+    let payload_length = u16::from_be_bytes(packet[18..20].try_into().ok()?) as usize;
+    if payload_length < NS_LENGTH || packet.len() < ICMP_OFFSET + payload_length {
+        return None;
+    }
+    let source_ip: [u8; 16] = packet[22..38].try_into().ok()?;
+    let destination_ip: [u8; 16] = packet[38..54].try_into().ok()?;
+    let target = config.local_ipv6.octets();
+    let mut solicited_node = [0u8; 16];
+    solicited_node[..13].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff]);
+    solicited_node[13..].copy_from_slice(&target[13..]);
+    let icmp = &packet[ICMP_OFFSET..ICMP_OFFSET + payload_length];
+    if (destination_ip != target && destination_ip != solicited_node)
+        || icmp[0] != 135
+        || icmp[1] != 0
+        || icmp[8..24] != target
+        || icmpv6_checksum(&source_ip, &destination_ip, icmp) != 0
+    {
+        return None;
+    }
+
+    let unspecified = source_ip == [0; 16];
+    let destination_mac = if unspecified {
+        [0x33, 0x33, 0, 0, 0, 1]
+    } else {
+        packet[6..12].try_into().ok()?
+    };
+    let reply_destination_ip = if unspecified {
+        [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    } else {
+        source_ip
+    };
+    let mut reply = vec![0u8; ICMP_OFFSET + NA_LENGTH];
+    reply[..6].copy_from_slice(&destination_mac);
+    reply[6..12].copy_from_slice(&local_mac);
+    reply[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
+    reply[14] = 0x60;
+    reply[18..20].copy_from_slice(&(NA_LENGTH as u16).to_be_bytes());
+    reply[20] = NEXT_ICMPV6;
+    reply[21] = 255;
+    reply[22..38].copy_from_slice(&target);
+    reply[38..54].copy_from_slice(&reply_destination_ip);
+    reply[54] = 136;
+    reply[58] = if unspecified { 0x20 } else { 0x60 }; // Override, plus Solicited outside DAD.
+    reply[62..78].copy_from_slice(&target);
+    reply[78] = 2; // Target Link-Layer Address
+    reply[79] = 1;
+    reply[80..86].copy_from_slice(&local_mac);
+    let checksum = icmpv6_checksum(&target, &reply_destination_ip, &reply[54..]);
+    reply[56..58].copy_from_slice(&checksum.to_be_bytes());
+    Some(reply)
+}
+
+fn icmpv6_checksum(source: &[u8; 16], destination: &[u8; 16], message: &[u8]) -> u16 {
+    let mut sum = source
+        .chunks_exact(2)
+        .chain(destination.chunks_exact(2))
+        .chain(message.chunks_exact(2))
+        .map(|word| u16::from_be_bytes([word[0], word[1]]) as u32)
+        .sum::<u32>();
+    sum += message.len() as u32 + NEXT_ICMPV6 as u32;
+    if let Some(&last) = message.chunks_exact(2).remainder().first() {
+        sum += u32::from(last) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn transmit(port: &Port, packets: &mut Vec<Packet>) -> io::Result<()> {
@@ -292,11 +391,22 @@ fn decapsulate_packet(
     dpdk: &Environment,
     config: &Config,
     reassembly: &mut Reassembly,
+    diagnostics: &mut Diagnostics,
 ) -> io::Result<Option<Packet>> {
     let Some(data) = packet.data() else {
         return Ok(None);
     };
-    if !valid_outer_packet(data, config) {
+    if let Err(reason) = valid_outer_packet(data, config) {
+        diagnostics.invalid_outer += 1;
+        match reason {
+            OuterError::Short => diagnostics.outer_short += 1,
+            OuterError::EtherType => diagnostics.outer_ether_type += 1,
+            OuterError::Version => diagnostics.outer_version += 1,
+            OuterError::Length => diagnostics.outer_length += 1,
+            OuterError::Protocol => diagnostics.outer_protocol += 1,
+            OuterError::Source => diagnostics.outer_source += 1,
+            OuterError::Destination => diagnostics.outer_destination += 1,
+        }
         return Ok(None);
     }
     let payload_length = u16::from_be_bytes([data[18], data[19]]) as usize;
@@ -304,6 +414,7 @@ fn decapsulate_packet(
     match data[20] {
         NEXT_ETHERIP if etherip_payload(payload).is_some() => {
             packet.adjust(56)?;
+            diagnostics.decap_ok += 1;
             Ok(Some(packet))
         }
         NEXT_FRAGMENT if payload.len() >= 8 && payload[0] == NEXT_ETHERIP && payload[1] == 0 => {
@@ -325,11 +436,78 @@ fn decapsulate_packet(
                 return Ok(None);
             };
             let Some(frame) = etherip_payload(&etherip) else {
+                diagnostics.invalid_etherip += 1;
                 return Ok(None);
             };
+            diagnostics.decap_ok += 1;
             Ok(Some(dpdk.packet(frame)?))
         }
+        NEXT_ETHERIP => {
+            diagnostics.invalid_etherip += 1;
+            Ok(None)
+        }
         _ => Ok(None),
+    }
+}
+
+struct Diagnostics {
+    since: Instant,
+    wan_rx: u64,
+    invalid_outer: u64,
+    outer_short: u64,
+    outer_ether_type: u64,
+    outer_version: u64,
+    outer_length: u64,
+    outer_protocol: u64,
+    outer_source: u64,
+    outer_destination: u64,
+    invalid_etherip: u64,
+    decap_ok: u64,
+    lan_tx: u64,
+    lan_tx_unsent: u64,
+}
+
+impl Diagnostics {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            wan_rx: 0,
+            invalid_outer: 0,
+            outer_short: 0,
+            outer_ether_type: 0,
+            outer_version: 0,
+            outer_length: 0,
+            outer_protocol: 0,
+            outer_source: 0,
+            outer_destination: 0,
+            invalid_etherip: 0,
+            decap_ok: 0,
+            lan_tx: 0,
+            lan_tx_unsent: 0,
+        }
+    }
+
+    fn report(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        eprintln!(
+            "wan_rx={} invalid_outer={} [short={} ether_type={} version={} length={} protocol={} source={} destination={}] invalid_etherip={} decap_ok={} lan_tx={} lan_tx_unsent={}",
+            self.wan_rx,
+            self.invalid_outer,
+            self.outer_short,
+            self.outer_ether_type,
+            self.outer_version,
+            self.outer_length,
+            self.outer_protocol,
+            self.outer_source,
+            self.outer_destination,
+            self.invalid_etherip,
+            self.decap_ok,
+            self.lan_tx,
+            self.lan_tx_unsent
+        );
+        *self = Self::new();
     }
 }
 
@@ -337,17 +515,41 @@ fn etherip_payload(payload: &[u8]) -> Option<&[u8]> {
     payload.strip_prefix(&ETHERIP_HEADER)
 }
 
-fn valid_outer_packet(packet: &[u8], config: &Config) -> bool {
-    if packet.len() < 54
-        || u16::from_be_bytes([packet[12], packet[13]]) != ETHER_TYPE_IPV6
-        || packet[14] >> 4 != 6
-    {
-        return false;
+#[derive(Debug, PartialEq)]
+enum OuterError {
+    Short,
+    EtherType,
+    Version,
+    Length,
+    Protocol,
+    Source,
+    Destination,
+}
+
+fn valid_outer_packet(packet: &[u8], config: &Config) -> Result<(), OuterError> {
+    if packet.len() < 54 {
+        return Err(OuterError::Short);
+    }
+    if u16::from_be_bytes([packet[12], packet[13]]) != ETHER_TYPE_IPV6 {
+        return Err(OuterError::EtherType);
+    }
+    if packet[14] >> 4 != 6 {
+        return Err(OuterError::Version);
     }
     let payload_length = u16::from_be_bytes([packet[18], packet[19]]) as usize;
-    packet.len() >= 54 + payload_length
-        && packet[22..38] == config.remote_ipv6.octets()
-        && packet[38..54] == config.local_ipv6.octets()
+    if packet.len() < 54 + payload_length {
+        return Err(OuterError::Length);
+    }
+    if packet[20] != NEXT_ETHERIP && packet[20] != NEXT_FRAGMENT {
+        return Err(OuterError::Protocol);
+    }
+    if packet[22..38] != config.remote_ipv6.octets() {
+        return Err(OuterError::Source);
+    }
+    if packet[38..54] != config.local_ipv6.octets() {
+        return Err(OuterError::Destination);
+    }
+    Ok(())
 }
 
 type FragmentKey = ([u8; 16], [u8; 16], u32);
@@ -502,7 +704,7 @@ mod tests {
         let mut reassembly = Reassembly::default();
         let mut result = None;
         for packet in packets.into_iter().rev() {
-            assert!(valid_outer_packet(&packet, &reverse));
+            assert_eq!(valid_outer_packet(&packet, &reverse), Ok(()));
             let payload = &packet[54..];
             let field = u16::from_be_bytes([payload[2], payload[3]]);
             let key = (
@@ -531,7 +733,7 @@ mod tests {
             remote_ipv6: config.local_ipv6,
             ..config
         };
-        assert!(valid_outer_packet(&packet, &reverse));
+        assert_eq!(valid_outer_packet(&packet, &reverse), Ok(()));
         assert!(etherip_payload(&packet[54..]).is_none());
         packet[54] = 0x30;
         assert_eq!(etherip_payload(&packet[54..]), Some([1].as_slice()));
@@ -545,6 +747,46 @@ mod tests {
         assert!(!table.contains_source(&frame));
         table.learn_source(&frame);
         assert!(table.contains_source(&frame));
+    }
+
+    #[test]
+    fn answers_neighbor_solicitation_for_local_wan_address() {
+        let config = config(1500);
+        let source_ip =
+            Ipv6Addr::from([0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]).octets();
+        let target = config.local_ipv6.octets();
+        let source_mac = [2, 0, 0, 0, 0, 2];
+        let local_mac = [2, 0, 0, 0, 0, 1];
+        let destination_ip = [
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, target[13], target[14], target[15],
+        ];
+        let mut request = vec![0u8; 86];
+        request[..6].copy_from_slice(&[0x33, 0x33, 0xff, target[13], target[14], target[15]]);
+        request[6..12].copy_from_slice(&source_mac);
+        request[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
+        request[14] = 0x60;
+        request[18..20].copy_from_slice(&32u16.to_be_bytes());
+        request[20] = NEXT_ICMPV6;
+        request[21] = 255;
+        request[22..38].copy_from_slice(&source_ip);
+        request[38..54].copy_from_slice(&destination_ip);
+        request[54] = 135;
+        request[62..78].copy_from_slice(&target);
+        request[78] = 1;
+        request[79] = 1;
+        request[80..86].copy_from_slice(&source_mac);
+        let checksum = icmpv6_checksum(&source_ip, &destination_ip, &request[54..]);
+        request[56..58].copy_from_slice(&checksum.to_be_bytes());
+
+        let reply = ndp_advertisement(&request, &config, local_mac).unwrap();
+        assert_eq!(&reply[..6], &source_mac);
+        assert_eq!(&reply[6..12], &local_mac);
+        assert_eq!(&reply[22..38], &target);
+        assert_eq!(&reply[38..54], &source_ip);
+        assert_eq!(reply[54], 136);
+        assert_eq!(reply[58], 0x60);
+        assert_eq!(icmpv6_checksum(&target, &source_ip, &reply[54..]), 0);
+        assert_eq!(&reply[80..86], &local_mac);
     }
 
     #[test]

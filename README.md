@@ -16,6 +16,7 @@ LAN A ─ LAN port [ endpoint A ] WAN port ══ IPv6 ══ WAN port [ endpoin
 - IPv6 Fragment Headerによる送信fragment化
 - 順不同fragmentの再構成、重複fragmentの破棄、60秒のタイムアウト
 - 対向から学習した送信元MACによる反射ループ抑止（保持時間5分）
+- WAN側local IPv6アドレスへのNDP Neighbor Solicitation応答
 - bindgenでDPDK Cヘッダーから生成したRust FFIと、安全な最小Rust API
 - burst RX/TXと`rte_mbuf`所有権移譲による通常パスのzero-copy転送
 
@@ -142,8 +143,8 @@ EtherIPオプション:
 | `--burst-size <N>` | no | RX burst数。8の倍数、既定値32 |
 
 `--next-hop-mac`には、対向が同一L2セグメントなら対向WANポートのMAC、
-ルーター越しならnext-hopルーターのMACを指定します。本プログラムはNDPや経路探索を
-行いません。
+ルーター越しならnext-hopルーターのMACを指定します。本プログラムは自身の
+`--local-ipv6`に対するNDPへ応答しますが、next hopのNDP探索や経路探索は行いません。
 
 ## 2拠点の設定例
 
@@ -222,7 +223,7 @@ RFC 3378自体にはhop countやループ防止機構がありません。複数
 - 機密性や改ざん防止が必要なら外側IPv6通信をIPsecなどで保護してください。
 - IPv6拡張ヘッダーは、IPv6ヘッダー直後のFragment Headerだけに対応します。
 - VLANフレームはそのまま転送しますが、VLAN別のフィルタリングは行いません。
-- NDP、IPv6 routing、Path MTU Discovery、ICMPv6生成は実装していません。
+- next hopのNDP探索、IPv6 routing、Path MTU Discovery、NDP以外のICMPv6生成は実装していません。
 - fragment再構成は最大1024パケット、1パケット最大128 fragmentに制限しています。
 - DPDKポートはpromiscuous modeで動作します。
 
