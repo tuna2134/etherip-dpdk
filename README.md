@@ -201,7 +201,8 @@ WANからLAN方向:
 通常パスでは受信した`rte_mbuf`へ外側headerをprepend、または受信headerをadjustし、
 ユーザーバッファへコピーせずburst送信します。IPv6 fragmentの生成と再構成だけは、
 1個のmbufを複数packetへ分割・統合する必要があるためコピーします。TXが受理した
-mbufの所有権はDPDKへ移り、未送信・破棄packetだけをRust側で解放します。
+mbufの所有権はDPDKへ移り、一部しか受理しなかった場合は未送信packetを次のループで
+再送します。破棄packetだけをRust側で解放します。
 
 ## ループ抑止とMAC学習
 

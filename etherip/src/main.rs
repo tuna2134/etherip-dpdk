@@ -110,7 +110,6 @@ fn main() -> io::Result<()> {
     let mut diagnostics = Diagnostics::new();
 
     loop {
-        tunnel_packets.clear();
         lan.receive_burst_into(&mut lan_received, config.burst_size)?;
         for packet in lan_received.drain(..) {
             let tunnel = packet
@@ -128,7 +127,6 @@ fn main() -> io::Result<()> {
         }
         transmit(&wan, &mut tunnel_packets)?;
 
-        lan_packets.clear();
         wan.receive_burst_into(&mut wan_received, config.burst_size)?;
         diagnostics.wan_rx += wan_received.len() as u64;
         for packet in wan_received.drain(..) {
