@@ -107,7 +107,6 @@ fn main() -> io::Result<()> {
     let mut wan_received = Vec::with_capacity(capacity);
     let mut tunnel_packets = Vec::with_capacity(capacity);
     let mut lan_packets = Vec::with_capacity(capacity);
-    let mut diagnostics = Diagnostics::new();
 
     loop {
         lan.receive_burst_into(&mut lan_received, config.burst_size)?;
@@ -128,7 +127,6 @@ fn main() -> io::Result<()> {
         transmit(&wan, &mut tunnel_packets)?;
 
         wan.receive_burst_into(&mut wan_received, config.burst_size)?;
-        diagnostics.wan_rx += wan_received.len() as u64;
         for packet in wan_received.drain(..) {
             if let Some(reply) = packet
                 .data()
@@ -137,9 +135,7 @@ fn main() -> io::Result<()> {
                 tunnel_packets.push(dpdk.packet(&reply)?);
                 continue;
             }
-            if let Some(packet) =
-                decapsulate_packet(packet, &dpdk, &config, &mut reassembly, &mut diagnostics)?
-            {
+            if let Some(packet) = decapsulate_packet(packet, &dpdk, &config, &mut reassembly)? {
                 if let Some(frame) = packet.data() {
                     remote_macs.learn_source(frame);
                 }
@@ -147,11 +143,7 @@ fn main() -> io::Result<()> {
             }
         }
         transmit(&wan, &mut tunnel_packets)?;
-        let queued = lan_packets.len();
         transmit(&lan, &mut lan_packets)?;
-        diagnostics.lan_tx += (queued - lan_packets.len()) as u64;
-        diagnostics.lan_tx_unsent += lan_packets.len() as u64;
-        diagnostics.report();
         reassembly.expire();
         remote_macs.expire();
     }
@@ -389,22 +381,11 @@ fn decapsulate_packet(
     dpdk: &Environment,
     config: &Config,
     reassembly: &mut Reassembly,
-    diagnostics: &mut Diagnostics,
 ) -> io::Result<Option<Packet>> {
     let Some(data) = packet.data() else {
         return Ok(None);
     };
-    if let Err(reason) = valid_outer_packet(data, config) {
-        diagnostics.invalid_outer += 1;
-        match reason {
-            OuterError::Short => diagnostics.outer_short += 1,
-            OuterError::EtherType => diagnostics.outer_ether_type += 1,
-            OuterError::Version => diagnostics.outer_version += 1,
-            OuterError::Length => diagnostics.outer_length += 1,
-            OuterError::Protocol => diagnostics.outer_protocol += 1,
-            OuterError::Source => diagnostics.outer_source += 1,
-            OuterError::Destination => diagnostics.outer_destination += 1,
-        }
+    if valid_outer_packet(data, config).is_err() {
         return Ok(None);
     }
     let payload_length = u16::from_be_bytes([data[18], data[19]]) as usize;
@@ -412,7 +393,6 @@ fn decapsulate_packet(
     match data[20] {
         NEXT_ETHERIP if etherip_payload(payload).is_some() => {
             packet.adjust(56)?;
-            diagnostics.decap_ok += 1;
             Ok(Some(packet))
         }
         NEXT_FRAGMENT if payload.len() >= 8 && payload[0] == NEXT_ETHERIP && payload[1] == 0 => {
@@ -434,78 +414,12 @@ fn decapsulate_packet(
                 return Ok(None);
             };
             let Some(frame) = etherip_payload(&etherip) else {
-                diagnostics.invalid_etherip += 1;
                 return Ok(None);
             };
-            diagnostics.decap_ok += 1;
             Ok(Some(dpdk.packet(frame)?))
         }
-        NEXT_ETHERIP => {
-            diagnostics.invalid_etherip += 1;
-            Ok(None)
-        }
+        NEXT_ETHERIP => Ok(None),
         _ => Ok(None),
-    }
-}
-
-struct Diagnostics {
-    since: Instant,
-    wan_rx: u64,
-    invalid_outer: u64,
-    outer_short: u64,
-    outer_ether_type: u64,
-    outer_version: u64,
-    outer_length: u64,
-    outer_protocol: u64,
-    outer_source: u64,
-    outer_destination: u64,
-    invalid_etherip: u64,
-    decap_ok: u64,
-    lan_tx: u64,
-    lan_tx_unsent: u64,
-}
-
-impl Diagnostics {
-    fn new() -> Self {
-        Self {
-            since: Instant::now(),
-            wan_rx: 0,
-            invalid_outer: 0,
-            outer_short: 0,
-            outer_ether_type: 0,
-            outer_version: 0,
-            outer_length: 0,
-            outer_protocol: 0,
-            outer_source: 0,
-            outer_destination: 0,
-            invalid_etherip: 0,
-            decap_ok: 0,
-            lan_tx: 0,
-            lan_tx_unsent: 0,
-        }
-    }
-
-    fn report(&mut self) {
-        if self.since.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        eprintln!(
-            "wan_rx={} invalid_outer={} [short={} ether_type={} version={} length={} protocol={} source={} destination={}] invalid_etherip={} decap_ok={} lan_tx={} lan_tx_unsent={}",
-            self.wan_rx,
-            self.invalid_outer,
-            self.outer_short,
-            self.outer_ether_type,
-            self.outer_version,
-            self.outer_length,
-            self.outer_protocol,
-            self.outer_source,
-            self.outer_destination,
-            self.invalid_etherip,
-            self.decap_ok,
-            self.lan_tx,
-            self.lan_tx_unsent
-        );
-        *self = Self::new();
     }
 }
 
