@@ -324,27 +324,28 @@ impl Packet {
     }
 
     pub fn data(&self) -> Option<&[u8]> {
-        if self.segment_count() != 1 {
+        let mut data = ptr::null_mut();
+        let mut length = 0u16;
+        // SAFETY: data and length point to writable locals for the duration of the call.
+        let single = unsafe { ffi::dpdk_mbuf_single_data(self.as_ptr(), &mut data, &mut length) };
+        if single == 0 {
             return None;
         }
-        // SAFETY: a single-segment mbuf owns data_length initialized bytes.
-        Some(unsafe {
-            slice::from_raw_parts(
-                ffi::dpdk_mbuf_data(self.as_ptr()).cast(),
-                self.data_length(),
-            )
-        })
+        // SAFETY: a single-segment mbuf owns `length` initialized bytes at `data`.
+        Some(unsafe { slice::from_raw_parts(data.cast::<u8>(), usize::from(length)) })
     }
 
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
-        if self.segment_count() != 1 {
+        let mut data = ptr::null_mut();
+        let mut length = 0u16;
+        // SAFETY: data and length point to writable locals for the duration of the call.
+        let single = unsafe { ffi::dpdk_mbuf_single_data(self.as_ptr(), &mut data, &mut length) };
+        if single == 0 {
             return None;
         }
-        let length = self.data_length();
+        let length = usize::from(length);
         // SAFETY: &mut self provides exclusive access to the live mbuf data.
-        Some(unsafe {
-            slice::from_raw_parts_mut(ffi::dpdk_mbuf_data(self.as_ptr()).cast(), length)
-        })
+        Some(unsafe { slice::from_raw_parts_mut(data.cast::<u8>(), length) })
     }
 
     pub fn prepend(&mut self, length: usize) -> io::Result<&mut [u8]> {
@@ -391,16 +392,6 @@ impl Packet {
         self.pointer
             .expect("packet ownership was transferred")
             .as_ptr()
-    }
-
-    fn data_length(&self) -> usize {
-        // SAFETY: as_ptr is a live owned mbuf.
-        unsafe { ffi::dpdk_mbuf_data_length(self.as_ptr()) as usize }
-    }
-
-    fn segment_count(&self) -> u16 {
-        // SAFETY: as_ptr is a live owned mbuf.
-        unsafe { ffi::dpdk_mbuf_segment_count(self.as_ptr()) }
     }
 }
 

@@ -89,29 +89,27 @@ fn main() -> io::Result<()> {
             if tunnels[index].vlan.is_some() {
                 strip_vlan_tag(&mut packet)?;
             }
-            tunnel_packets.extend(encapsulate_packet(
+            encapsulate_packet(
                 packet,
                 &dpdk,
                 &tunnels[index],
                 wan_mac,
                 &mut identification,
-            )?);
+                &mut tunnel_packets,
+            )?;
         }
         transmit(&wan, &mut tunnel_packets)?;
 
         wan.receive_burst_into(&mut wan_received, config.burst_size)?;
         for packet in wan_received.drain(..) {
-            if let Some(reply) = packet
-                .data()
-                .and_then(|data| ndp_advertisement(data, config.local_ipv6, wan_mac))
-            {
-                tunnel_packets.push(dpdk.packet(&reply)?);
-                continue;
-            }
             let Some(data) = packet.data() else {
                 continue;
             };
             let Some(index) = tunnel_index_for_wan(data, &tunnels) else {
+                if let Some(reply) = ndp_advertisement(data, config.local_ipv6, wan_mac) {
+                    tunnel_packets.push(dpdk.packet(&reply)?);
+                    continue;
+                }
                 let source = data
                     .get(22..38)
                     .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())

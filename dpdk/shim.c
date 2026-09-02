@@ -38,18 +38,15 @@ int dpdk_pktmbuf_trim(struct rte_mbuf *packet, uint16_t length) {
     return rte_pktmbuf_trim(packet, length);
 }
 
-void *dpdk_mbuf_data(struct rte_mbuf *packet) {
-    return rte_pktmbuf_mtod(packet, void *);
+int dpdk_mbuf_single_data(struct rte_mbuf *packet, void **data, uint16_t *length) {
+    if (packet->nb_segs != 1) {
+        return 0;
+    }
+    *data = rte_pktmbuf_mtod(packet, void *);
+    *length = rte_pktmbuf_data_len(packet);
+    return 1;
 }
 
 uint32_t dpdk_mbuf_packet_length(const struct rte_mbuf *packet) {
     return rte_pktmbuf_pkt_len(packet);
-}
-
-uint16_t dpdk_mbuf_data_length(const struct rte_mbuf *packet) {
-    return rte_pktmbuf_data_len(packet);
-}
-
-uint16_t dpdk_mbuf_segment_count(const struct rte_mbuf *packet) {
-    return packet->nb_segs;
 }

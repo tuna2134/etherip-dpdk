@@ -65,36 +65,38 @@ pub fn add_vlan_tag(packet: &mut Packet, vlan: u16) -> io::Result<()> {
 }
 
 /// Wraps a LAN frame as an EtherIP packet, prepending the outer header in place or
-/// producing IPv6 fragments when the frame exceeds the tunnel MTU.
+/// producing IPv6 fragments when the frame exceeds the tunnel MTU. Resulting
+/// packets are appended to `out` to avoid per-packet allocations.
 pub fn encapsulate_packet(
     mut packet: Packet,
     dpdk: &Environment,
     tunnel: &Tunnel,
     source_mac: [u8; 6],
     id: &mut u32,
-) -> io::Result<Vec<Packet>> {
-    let frame_length = packet
+    out: &mut Vec<Packet>,
+) -> io::Result<()> {
+    let frame = packet
         .data()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment LAN packet"))?
-        .len();
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment LAN packet"))?;
+    let frame_length = frame.len();
     if 40 + ETHERIP_HEADER.len() + frame_length <= tunnel.mtu {
         let header = packet.prepend(56)?;
         write_outer_header(header, tunnel, source_mac, NEXT_ETHERIP, frame_length + 2);
         header[54..56].copy_from_slice(&ETHERIP_HEADER);
         debug!(frame_length, "sending EtherIP packet");
-        return Ok(vec![packet]);
+        out.push(packet);
+        return Ok(());
     }
-    let frame = packet.data().expect("packet was checked as contiguous");
-    let packets = fragment_packets(frame, tunnel, source_mac, id)?
-        .into_iter()
-        .map(|bytes| dpdk.packet(&bytes))
-        .collect::<io::Result<Vec<_>>>()?;
+    let fragments = fragment_packets(frame, tunnel, source_mac, id)?;
     debug!(
         frame_length,
-        fragments = packets.len(),
-        "sending EtherIP packet"
+        fragments = fragments.len(),
+        "sending fragmented EtherIP packet"
     );
-    Ok(packets)
+    for bytes in fragments {
+        out.push(dpdk.packet(&bytes)?);
+    }
+    Ok(())
 }
 
 pub fn fragment_packets(

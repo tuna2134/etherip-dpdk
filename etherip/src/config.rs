@@ -83,7 +83,7 @@ pub struct Config {
     pub socket_id: Option<u32>,
 
     /// Number of packets requested from each RX burst (multiple of 8).
-    #[arg(long, default_value_t = 32, value_parser = parse_burst_size)]
+    #[arg(long, default_value_t = 64, value_parser = parse_burst_size)]
     pub burst_size: u16,
 }
 

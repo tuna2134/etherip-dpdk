@@ -144,7 +144,7 @@ EtherIPオプション:
 | `--rx-descriptors <N>` | no | queueごとのRX descriptor数。既定値1024 |
 | `--tx-descriptors <N>` | no | queueごとのTX descriptor数。既定値1024 |
 | `--socket-id <ID>` | no | mempoolとqueueのNUMA socket。省略時はDPDKが選択 |
-| `--burst-size <N>` | no | RX burst数。8の倍数、既定値32 |
+| `--burst-size <N>` | no | RX burst数。8の倍数、既定値64 |
 
 `--next-hop-mac`には、対向が同一L2セグメントなら対向WANポートのMAC、
 ルーター越しならnext-hopルーターのMACを指定します。本プログラムは自身の
