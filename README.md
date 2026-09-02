@@ -137,7 +137,7 @@ EtherIPオプション:
 | `--local-ipv6 <ADDR>` | yes | 外側IPv6ヘッダーの送信元アドレス |
 | `--remote-ipv6 <ADDR>` | one* | 単一トンネル時の対向EtherIP endpointのIPv6アドレス |
 | `--next-hop-mac <MAC>` | one* | 単一トンネル時のWAN側IPv6 next hopのMACアドレス |
-| `--tunnel <VLAN>:<REMOTE>:<MAC>[:<MTU>]` | many* | 複数トンネルを1本ずつ追加。`*`は単一トンネル（`--remote-ipv6`/`--next-hop-mac`）か`--tunnel`のどちらか一方を使う |
+| `--tunnel <VLAN>,<REMOTE>,<MAC>[,<MTU>]` | many* | 複数トンネルを1本ずつ追加。`*`は単一トンネル（`--remote-ipv6`/`--next-hop-mac`）か`--tunnel`のどちらか一方を使う |
 | `--mtu <BYTES>` | no | 外側IPv6 MTU。既定値1500、範囲70～65575。`--tunnel`側で個別上書き可 |
 | `--rx-queue <ID>` | no | 両ポートで使うRX queue。既定値0 |
 | `--tx-queue <ID>` | no | 両ポートで使うTX queue。既定値0 |
@@ -204,15 +204,15 @@ sudo target/release/etherip \
   --lan-port 0 \
   --wan-port 1 \
   --local-ipv6 2001:db8:1::1 \
-  --tunnel 100:2001:db8:1::2:02:00:00:00:00:02 \
-  --tunnel 200:2001:db8:1::3:02:00:00:00:00:03 \
+  --tunnel 100,2001:db8:1::2,02:00:00:00:00:02 \
+  --tunnel 200,2001:db8:1::3,02:00:00:00:00:03 \
   --mtu 1500
 ```
 
 LAN側でVLAN 100のタグが付いたフレームは`2001:db8:1::2`へ、VLAN 200は
 `2001:db8:1::3`へのトンネルで転送されます。タグなしのフレームは破棄されます。
 対向側も同様に`--tunnel`を設定し、VLAN IDを両端で合わせてください（例えば
-endpoint Bは`--tunnel 100:2001:db8:1::1:...`）。
+endpoint Bは`--tunnel 100,2001:db8:1::1,...`）。
 
 ## パケット処理
 

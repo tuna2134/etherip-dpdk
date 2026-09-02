@@ -973,9 +973,9 @@ mod tests {
             "--local-ipv6",
             "2001:db8::1",
             "--tunnel",
-            "100:2001:db8::2:02:00:00:00:00:02",
+            "100,2001:db8::2,02:00:00:00:00:02",
             "--tunnel",
-            "200:2001:db8::3:02:00:00:00:00:03:9000",
+            "200,2001:db8::3,02:00:00:00:00:03,9000",
         ]
         .map(str::to_owned);
         let config = Config::try_parse_from(args).unwrap();
@@ -986,6 +986,22 @@ mod tests {
         assert_eq!(tunnels[0].vlan, Some(100));
         assert_eq!(tunnels[1].vlan, Some(200));
         assert_eq!(tunnels[1].mtu, 9000);
+    }
+
+    #[test]
+    fn parses_expanded_ipv6_tunnel() {
+        let spec =
+            parse_tunnel("100,2001:0db8:0000:0000:0000:0000:0000:0002,02:00:00:00:00:02,9000")
+                .unwrap();
+        assert_eq!(spec.vlan, 100);
+        assert_eq!(
+            spec.remote_ipv6,
+            Ipv6Addr::from([0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+        );
+        assert_eq!(spec.next_hop_mac, [2, 0, 0, 0, 0, 2]);
+        assert_eq!(spec.mtu, Some(9000));
+        assert!(parse_tunnel("100,2001:db8::2").is_err());
+        assert!(parse_tunnel("100,2001:db8::2,02:00:00:00:00:02,1500,extra").is_err());
     }
 
     #[test]
@@ -1003,7 +1019,7 @@ mod tests {
             "--next-hop-mac",
             "02:00:00:00:00:02",
             "--tunnel",
-            "100:2001:db8::2:02:00:00:00:00:02",
+            "100,2001:db8::2,02:00:00:00:00:02",
         ]
         .map(str::to_owned);
         assert!(Config::try_parse_from(args).is_err());
@@ -1013,8 +1029,8 @@ mod tests {
     fn rejects_duplicate_tunnel_vlans() {
         let config = Config {
             tunnels: vec![
-                parse_tunnel("100:2001:db8:1::2:02:00:00:00:00:02").unwrap(),
-                parse_tunnel("100:2001:db8:1::3:02:00:00:00:00:03").unwrap(),
+                parse_tunnel("100,2001:db8:1::2,02:00:00:00:00:02").unwrap(),
+                parse_tunnel("100,2001:db8:1::3,02:00:00:00:00:03").unwrap(),
             ],
             ..config(1500)
         };
