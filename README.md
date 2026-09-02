@@ -308,6 +308,7 @@ dpdk/
   shim.c         bindgenから呼べないmacro/static inlineだけを包むC shim
   src/lib.rs     DPDKの安全なRustラッパー
 etherip/
+  src/lib.rs         ライブラリクレート。モジュールを公開
   src/main.rs        CLI、転送ループ
   src/config.rs      CLI定義、トンネル設定の解決、パース
   src/etherip.rs     EtherIP/IPv6カプセル化・デカプセル化、fragment化、VLAN処理
@@ -315,6 +316,7 @@ etherip/
   src/mac_table.rs   トンネルごとのMAC学習によるループ抑止
   src/reassembly.rs  IPv6 fragment再構成
   src/protocol.rs    IPv6/EtherIP/Ethernetのプロトコル定数
+  tests/etherip.rs   統合テスト（libの公開APIを検証）
 rfc3378.txt      実装の基準としたRFC 3378本文
 ```
 
