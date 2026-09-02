@@ -1,105 +1,22 @@
+mod config;
+mod etherip;
+mod mac_table;
+mod ndp;
+mod protocol;
+mod reassembly;
+
 use clap::Parser;
+use config::{Config, build_tunnels, split_args};
 use dpdk::{Environment, MempoolConfig, Packet, Port, PortConfig};
-use std::{
-    collections::HashMap,
-    env, io,
-    net::Ipv6Addr,
-    time::{Duration, Instant},
+use etherip::{
+    add_vlan_tag, decapsulate_packet, encapsulate_packet, strip_vlan_tag, tunnel_for_lan_frame,
+    tunnel_index_for_wan, vlan_id,
 };
+use mac_table::MacTable;
+use ndp::ndp_advertisement;
+use reassembly::Reassembly;
+use std::{env, io, net::Ipv6Addr};
 use tracing::debug;
-
-const ETHER_TYPE_IPV6: u16 = 0x86dd;
-const ETHER_TYPE_VLAN: u16 = 0x8100;
-const NEXT_ICMPV6: u8 = 58;
-const NEXT_ETHERIP: u8 = 97;
-const NEXT_FRAGMENT: u8 = 44;
-const ETHERIP_HEADER: [u8; 2] = [0x30, 0];
-const MAX_PACKET: usize = 65_535;
-const MAC_AGE: Duration = Duration::from_secs(300);
-
-/// One tunnel endpoint and the LAN-side VLAN that selects it.
-///
-/// `vlan: None` keeps the legacy single-tunnel mode, in which every LAN frame is
-/// bridged as-is (VLAN tags pass through untouched).
-#[derive(Clone, Copy, Debug)]
-struct Tunnel {
-    vlan: Option<u16>,
-    local_ipv6: Ipv6Addr,
-    remote_ipv6: Ipv6Addr,
-    next_hop_mac: [u8; 6],
-    mtu: usize,
-}
-
-/// Parsed value of one `--tunnel` argument before defaults are resolved.
-#[derive(Clone, Copy, Debug)]
-struct TunnelSpec {
-    vlan: u16,
-    remote_ipv6: Ipv6Addr,
-    next_hop_mac: [u8; 6],
-    mtu: Option<usize>,
-}
-
-#[derive(Parser)]
-#[command(
-    version,
-    about = "Bridge Ethernet frames through an RFC 3378 EtherIP/IPv6 tunnel",
-    after_help = "DPDK EAL options go before `--`, for example:\n  etherip -l 0 -- --lan-port 0 --wan-port 1 --local-ipv6 2001:db8::1 --remote-ipv6 2001:db8::2 --next-hop-mac 02:00:00:00:00:02\n  For multiple tunnels use --tunnel instead:\n  etherip -l 0 -- --lan-port 0 --wan-port 1 --local-ipv6 2001:db8::1 --tunnel 100,2001:db8::2,02:00:00:00:00:02 --tunnel 200,2001:db8::3,02:00:00:00:00:03"
-)]
-struct Config {
-    /// DPDK port connected to the bridged LAN.
-    #[arg(long = "lan-port")]
-    lan: u16,
-
-    /// DPDK port carrying the outer IPv6 packets.
-    #[arg(long = "wan-port")]
-    wan: u16,
-
-    /// Local address used by the outer IPv6 header.
-    #[arg(long)]
-    local_ipv6: Ipv6Addr,
-
-    /// Remote EtherIP endpoint's IPv6 address for the single-tunnel mode.
-    #[arg(long, conflicts_with = "tunnels")]
-    remote_ipv6: Option<Ipv6Addr>,
-
-    /// Ethernet next-hop for the remote IPv6 endpoint for the single-tunnel mode.
-    #[arg(long, conflicts_with = "tunnels", value_parser = parse_mac)]
-    next_hop_mac: Option<[u8; 6]>,
-
-    /// Default outer IPv6 MTU; each --tunnel can override it.
-    #[arg(long, default_value_t = 1500, value_parser = parse_mtu)]
-    mtu: usize,
-
-    /// Add an EtherIP tunnel as <VLAN>,<REMOTE_IPV6>,<NEXT_HOP_MAC>[,<MTU>].
-    /// Repeatable. LAN frames tagged with the VLAN are bridged into the matching
-    /// tunnel; the tag is stripped before encapsulation and re-added on receive.
-    #[arg(long = "tunnel", value_parser = parse_tunnel)]
-    tunnels: Vec<TunnelSpec>,
-
-    /// RX queue used on both ports.
-    #[arg(long, default_value_t = 0)]
-    rx_queue: u16,
-
-    /// TX queue used on both ports.
-    #[arg(long, default_value_t = 0)]
-    tx_queue: u16,
-
-    /// RX descriptors allocated per port.
-    #[arg(long, default_value_t = 1024, value_parser = parse_nonzero_u16)]
-    rx_descriptors: u16,
-
-    /// TX descriptors allocated per port.
-    #[arg(long, default_value_t = 1024, value_parser = parse_nonzero_u16)]
-    tx_descriptors: u16,
-
-    /// NUMA socket for the mempool and queues; DPDK chooses it when omitted.
-    #[arg(long)]
-    socket_id: Option<u32>,
-
-    /// Number of packets requested from each RX burst (multiple of 8).
-    #[arg(long, default_value_t = 32, value_parser = parse_burst_size)]
-    burst_size: u16,
-}
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
@@ -146,12 +63,27 @@ fn main() -> io::Result<()> {
         lan.receive_burst_into(&mut lan_received, config.burst_size)?;
         for mut packet in lan_received.drain(..) {
             let Some(data) = packet.data() else {
+                debug!("dropping multi-segment LAN packet");
                 continue;
             };
             let Some(index) = tunnel_for_lan_frame(data, &tunnels) else {
+                match vlan_id(data) {
+                    Some(vlan) => {
+                        debug!(
+                            frame_length = data.len(),
+                            vlan, "dropping LAN frame for unknown VLAN"
+                        )
+                    }
+                    None => debug!(frame_length = data.len(), "dropping untagged LAN frame"),
+                }
                 continue;
             };
             if tables[index].contains_source(data) {
+                debug!(
+                    frame_length = data.len(),
+                    tunnel = index,
+                    "dropping LAN frame reflected from the remote"
+                );
                 continue;
             }
             if tunnels[index].vlan.is_some() {
@@ -171,7 +103,7 @@ fn main() -> io::Result<()> {
         for packet in wan_received.drain(..) {
             if let Some(reply) = packet
                 .data()
-                .and_then(|data| ndp_advertisement(data, &config, wan_mac))
+                .and_then(|data| ndp_advertisement(data, config.local_ipv6, wan_mac))
             {
                 tunnel_packets.push(dpdk.packet(&reply)?);
                 continue;
@@ -180,6 +112,21 @@ fn main() -> io::Result<()> {
                 continue;
             };
             let Some(index) = tunnel_index_for_wan(data, &tunnels) else {
+                let source = data
+                    .get(22..38)
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .map(Ipv6Addr::from);
+                let destination = data
+                    .get(38..54)
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .map(Ipv6Addr::from);
+                debug!(
+                    frame_length = data.len(),
+                    ?source,
+                    ?destination,
+                    next_header = data.get(20).copied(),
+                    "dropping WAN packet from an unknown tunnel"
+                );
                 continue;
             };
             if let Some(mut packet) =
@@ -203,580 +150,25 @@ fn main() -> io::Result<()> {
     }
 }
 
-fn build_tunnels(config: &Config) -> io::Result<Vec<Tunnel>> {
-    if config.tunnels.is_empty() {
-        let remote_ipv6 = config.remote_ipv6.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--remote-ipv6 is required without --tunnel",
-            )
-        })?;
-        let next_hop_mac = config.next_hop_mac.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--next-hop-mac is required without --tunnel",
-            )
-        })?;
-        return Ok(vec![Tunnel {
-            vlan: None,
-            local_ipv6: config.local_ipv6,
-            remote_ipv6,
-            next_hop_mac,
-            mtu: config.mtu,
-        }]);
-    }
-    let mut tunnels = Vec::with_capacity(config.tunnels.len());
-    for spec in &config.tunnels {
-        if tunnels
-            .iter()
-            .any(|tunnel: &Tunnel| tunnel.vlan == Some(spec.vlan))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate tunnel VLAN ID {}", spec.vlan),
-            ));
-        }
-        tunnels.push(Tunnel {
-            vlan: Some(spec.vlan),
-            local_ipv6: config.local_ipv6,
-            remote_ipv6: spec.remote_ipv6,
-            next_hop_mac: spec.next_hop_mac,
-            mtu: spec.mtu.unwrap_or(config.mtu),
-        });
-    }
-    Ok(tunnels)
-}
-
-/// Selects the tunnel for a LAN-side frame. The legacy single tunnel accepts every
-/// frame; with VLANs the frame must carry the matching 802.1Q tag.
-fn tunnel_for_lan_frame(frame: &[u8], tunnels: &[Tunnel]) -> Option<usize> {
-    if tunnels.len() == 1 && tunnels[0].vlan.is_none() {
-        return Some(0);
-    }
-    let vlan = vlan_id(frame)?;
-    tunnels.iter().position(|tunnel| tunnel.vlan == Some(vlan))
-}
-
-/// Selects the tunnel that an outer WAN packet belongs to by its source address.
-fn tunnel_index_for_wan(packet: &[u8], tunnels: &[Tunnel]) -> Option<usize> {
-    let source: [u8; 16] = packet.get(22..38)?.try_into().ok()?;
-    tunnels
-        .iter()
-        .position(|tunnel| tunnel.remote_ipv6.octets() == source)
-}
-
-fn vlan_id(frame: &[u8]) -> Option<u16> {
-    if frame.len() < 16 || u16::from_be_bytes([frame[12], frame[13]]) != ETHER_TYPE_VLAN {
-        return None;
-    }
-    Some(u16::from_be_bytes([frame[14], frame[15]]) & 0x0fff)
-}
-
-/// Removes the 4-byte 802.1Q header so the tunnel carries an untagged frame.
-fn strip_vlan_tag(packet: &mut Packet) -> io::Result<()> {
-    let data = packet
-        .data_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment VLAN packet"))?;
-    if data.len() < 16 || u16::from_be_bytes([data[12], data[13]]) != ETHER_TYPE_VLAN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "LAN frame has no VLAN tag",
-        ));
-    }
-    data.copy_within(16.., 12);
-    packet.trim_tail(4)
-}
-
-/// Prepends the configured 802.1Q header to a frame received from a tunnel.
-fn add_vlan_tag(packet: &mut Packet, vlan: u16) -> io::Result<()> {
-    let original = packet.len();
-    packet.append(4)?;
-    let data = packet
-        .data_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment tunnel frame"))?;
-    data.copy_within(12..original, 16);
-    data[12] = 0x81;
-    data[13] = 0x00;
-    data[14] = (vlan >> 8) as u8;
-    data[15] = (vlan & 0xff) as u8;
-    Ok(())
-}
-
-fn ndp_advertisement(packet: &[u8], config: &Config, local_mac: [u8; 6]) -> Option<Vec<u8>> {
-    const ICMP_OFFSET: usize = 54;
-    const NS_LENGTH: usize = 24;
-    const NA_LENGTH: usize = 32;
-
-    if packet.len() < ICMP_OFFSET + NS_LENGTH
-        || u16::from_be_bytes(packet[12..14].try_into().ok()?) != ETHER_TYPE_IPV6
-        || packet[14] >> 4 != 6
-        || packet[20] != NEXT_ICMPV6
-        || packet[21] != 255
-    {
-        return None;
-    }
-    let payload_length = u16::from_be_bytes(packet[18..20].try_into().ok()?) as usize;
-    if payload_length < NS_LENGTH || packet.len() < ICMP_OFFSET + payload_length {
-        return None;
-    }
-    let source_ip: [u8; 16] = packet[22..38].try_into().ok()?;
-    let destination_ip: [u8; 16] = packet[38..54].try_into().ok()?;
-    let target = config.local_ipv6.octets();
-    let mut solicited_node = [0u8; 16];
-    solicited_node[..13].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff]);
-    solicited_node[13..].copy_from_slice(&target[13..]);
-    let icmp = &packet[ICMP_OFFSET..ICMP_OFFSET + payload_length];
-    if (destination_ip != target && destination_ip != solicited_node)
-        || icmp[0] != 135
-        || icmp[1] != 0
-        || icmp[8..24] != target
-        || icmpv6_checksum(&source_ip, &destination_ip, icmp) != 0
-    {
-        return None;
-    }
-
-    let unspecified = source_ip == [0; 16];
-    let destination_mac = if unspecified {
-        [0x33, 0x33, 0, 0, 0, 1]
-    } else {
-        packet[6..12].try_into().ok()?
-    };
-    let reply_destination_ip = if unspecified {
-        [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-    } else {
-        source_ip
-    };
-    let mut reply = vec![0u8; ICMP_OFFSET + NA_LENGTH];
-    reply[..6].copy_from_slice(&destination_mac);
-    reply[6..12].copy_from_slice(&local_mac);
-    reply[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
-    reply[14] = 0x60;
-    reply[18..20].copy_from_slice(&(NA_LENGTH as u16).to_be_bytes());
-    reply[20] = NEXT_ICMPV6;
-    reply[21] = 255;
-    reply[22..38].copy_from_slice(&target);
-    reply[38..54].copy_from_slice(&reply_destination_ip);
-    reply[54] = 136;
-    reply[58] = if unspecified { 0x20 } else { 0x60 }; // Override, plus Solicited outside DAD.
-    reply[62..78].copy_from_slice(&target);
-    reply[78] = 2; // Target Link-Layer Address
-    reply[79] = 1;
-    reply[80..86].copy_from_slice(&local_mac);
-    let checksum = icmpv6_checksum(&target, &reply_destination_ip, &reply[54..]);
-    reply[56..58].copy_from_slice(&checksum.to_be_bytes());
-    Some(reply)
-}
-
-fn icmpv6_checksum(source: &[u8; 16], destination: &[u8; 16], message: &[u8]) -> u16 {
-    let mut sum = source
-        .chunks_exact(2)
-        .chain(destination.chunks_exact(2))
-        .chain(message.chunks_exact(2))
-        .map(|word| u16::from_be_bytes([word[0], word[1]]) as u32)
-        .sum::<u32>();
-    sum += message.len() as u32 + NEXT_ICMPV6 as u32;
-    if let Some(&last) = message.chunks_exact(2).remainder().first() {
-        sum += u32::from(last) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 fn transmit(port: &Port, packets: &mut Vec<Packet>) -> io::Result<()> {
     let sent = port.send_burst(packets)?;
     packets.drain(..sent);
     Ok(())
 }
 
-fn split_args(args: &[String]) -> (Vec<String>, Vec<String>) {
-    let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        return (vec![args[0].clone()], args.to_vec());
-    };
-    let mut app = Vec::with_capacity(args.len() - separator);
-    app.push(args[0].clone());
-    app.extend_from_slice(&args[separator + 1..]);
-    (args[..separator].to_vec(), app)
-}
-
-fn parse_mac(value: &str) -> Result<[u8; 6], String> {
-    let bytes: Vec<_> = value
-        .split(':')
-        .map(|part| u8::from_str_radix(part, 16))
-        .collect::<Result<_, _>>()
-        .map_err(|_| "invalid next-hop MAC")?;
-    bytes
-        .try_into()
-        .map_err(|_| "next-hop MAC must contain six octets".into())
-}
-
-fn parse_tunnel(value: &str) -> Result<TunnelSpec, String> {
-    let parts: Vec<_> = value.split(',').collect();
-    if !(3..=4).contains(&parts.len()) {
-        return Err("--tunnel must be <VLAN>,<REMOTE_IPV6>,<NEXT_HOP_MAC>[,<MTU>]".into());
-    }
-    let vlan = parse_vlan(parts[0])?;
-    let remote_ipv6 = parts[1]
-        .parse()
-        .map_err(|_| "invalid remote IPv6 address in --tunnel")?;
-    let next_hop_mac = parse_mac(parts[2])?;
-    let mtu = match parts.get(3) {
-        Some(mtu) => Some(parse_mtu(mtu)?),
-        None => None,
-    };
-    Ok(TunnelSpec {
-        vlan,
-        remote_ipv6,
-        next_hop_mac,
-        mtu,
-    })
-}
-
-fn parse_vlan(value: &str) -> Result<u16, String> {
-    let vlan = value.parse().map_err(|_| "VLAN ID must be an integer")?;
-    (1..=4094)
-        .contains(&vlan)
-        .then_some(vlan)
-        .ok_or_else(|| "VLAN ID must be between 1 and 4094".into())
-}
-
-fn parse_mtu(value: &str) -> Result<usize, String> {
-    let mtu = value.parse().map_err(|_| "MTU must be an integer")?;
-    (70..=65_575)
-        .contains(&mtu)
-        .then_some(mtu)
-        .ok_or_else(|| "MTU must be between 70 and 65575".into())
-}
-
-fn parse_nonzero_u16(value: &str) -> Result<u16, String> {
-    let value = value.parse().map_err(|_| "value must be an integer")?;
-    (value != 0)
-        .then_some(value)
-        .ok_or_else(|| "value must be greater than zero".into())
-}
-
-fn parse_burst_size(value: &str) -> Result<u16, String> {
-    let value = parse_nonzero_u16(value)?;
-    value
-        .is_multiple_of(8)
-        .then_some(value)
-        .ok_or_else(|| "burst size must be a multiple of 8".into())
-}
-
-fn encapsulate_packet(
-    mut packet: Packet,
-    dpdk: &Environment,
-    tunnel: &Tunnel,
-    source_mac: [u8; 6],
-    id: &mut u32,
-) -> io::Result<Vec<Packet>> {
-    let frame_length = packet
-        .data()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment LAN packet"))?
-        .len();
-    if 40 + ETHERIP_HEADER.len() + frame_length <= tunnel.mtu {
-        let header = packet.prepend(56)?;
-        write_outer_header(header, tunnel, source_mac, NEXT_ETHERIP, frame_length + 2);
-        header[54..56].copy_from_slice(&ETHERIP_HEADER);
-        debug!(frame_length, "sending EtherIP packet");
-        return Ok(vec![packet]);
-    }
-    let frame = packet.data().expect("packet was checked as contiguous");
-    let packets = fragment_packets(frame, tunnel, source_mac, id)?
-        .into_iter()
-        .map(|bytes| dpdk.packet(&bytes))
-        .collect::<io::Result<Vec<_>>>()?;
-    debug!(
-        frame_length,
-        fragments = packets.len(),
-        "sending EtherIP packet"
-    );
-    Ok(packets)
-}
-
-fn fragment_packets(
-    frame: &[u8],
-    tunnel: &Tunnel,
-    source_mac: [u8; 6],
-    id: &mut u32,
-) -> io::Result<Vec<Vec<u8>>> {
-    let mut payload = Vec::with_capacity(frame.len() + 2);
-    payload.extend_from_slice(&ETHERIP_HEADER);
-    payload.extend_from_slice(frame);
-    if payload.len() > u16::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "EtherIP payload exceeds the IPv6 payload limit",
-        ));
-    }
-    let chunk = ((tunnel
-        .mtu
-        .checked_sub(40 + 8)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MTU too small"))?)
-        / 8)
-        * 8;
-    if chunk == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "EtherIP frame cannot be fragmented for this MTU",
-        ));
-    }
-    *id = id.wrapping_add(1);
-    Ok(payload
-        .chunks(chunk)
-        .enumerate()
-        .map(|(index, part)| {
-            let more = index * chunk + part.len() < payload.len();
-            let offset_flags = (((index * chunk) / 8) as u16) << 3 | u16::from(more);
-            let mut fragment = Vec::with_capacity(8 + part.len());
-            fragment.push(NEXT_ETHERIP);
-            fragment.push(0);
-            fragment.extend_from_slice(&offset_flags.to_be_bytes());
-            fragment.extend_from_slice(&id.to_be_bytes());
-            fragment.extend_from_slice(part);
-            ipv6_packet(tunnel, source_mac, NEXT_FRAGMENT, &fragment)
-        })
-        .collect())
-}
-
-fn ipv6_packet(tunnel: &Tunnel, source_mac: [u8; 6], next: u8, payload: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(54 + payload.len());
-    packet.resize(54, 0);
-    write_outer_header(&mut packet, tunnel, source_mac, next, payload.len());
-    packet.extend_from_slice(payload);
-    packet
-}
-
-fn write_outer_header(
-    header: &mut [u8],
-    tunnel: &Tunnel,
-    source_mac: [u8; 6],
-    next: u8,
-    payload_length: usize,
-) {
-    header[0..6].copy_from_slice(&tunnel.next_hop_mac);
-    header[6..12].copy_from_slice(&source_mac);
-    header[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
-    header[14..18].copy_from_slice(&[0x60, 0, 0, 0]);
-    header[18..20].copy_from_slice(&(payload_length as u16).to_be_bytes());
-    header[20] = next;
-    header[21] = 64;
-    header[22..38].copy_from_slice(&tunnel.local_ipv6.octets());
-    header[38..54].copy_from_slice(&tunnel.remote_ipv6.octets());
-}
-
-fn decapsulate_packet(
-    mut packet: Packet,
-    dpdk: &Environment,
-    tunnel: &Tunnel,
-    reassembly: &mut Reassembly,
-) -> io::Result<Option<Packet>> {
-    let Some(data) = packet.data() else {
-        return Ok(None);
-    };
-    if valid_outer_packet(data, tunnel).is_err() {
-        return Ok(None);
-    }
-    let payload_length = u16::from_be_bytes([data[18], data[19]]) as usize;
-    let payload = &data[54..54 + payload_length];
-    match data[20] {
-        NEXT_ETHERIP if etherip_payload(payload).is_some() => {
-            packet.adjust(56)?;
-            debug!(frame_length = payload_length - 2, "received EtherIP packet");
-            Ok(Some(packet))
-        }
-        NEXT_FRAGMENT if payload.len() >= 8 && payload[0] == NEXT_ETHERIP && payload[1] == 0 => {
-            let field = u16::from_be_bytes([payload[2], payload[3]]);
-            if field & 6 != 0 {
-                return Ok(None);
-            }
-            let key = (
-                data[22..38].try_into().unwrap(),
-                data[38..54].try_into().unwrap(),
-                u32::from_be_bytes(payload[4..8].try_into().unwrap()),
-            );
-            let Some(etherip) = reassembly.insert(
-                key,
-                (field as usize >> 3) * 8,
-                field & 1 != 0,
-                &payload[8..],
-            ) else {
-                return Ok(None);
-            };
-            let Some(frame) = etherip_payload(&etherip) else {
-                return Ok(None);
-            };
-            debug!(frame_length = frame.len(), "received EtherIP packet");
-            Ok(Some(dpdk.packet(frame)?))
-        }
-        NEXT_ETHERIP => Ok(None),
-        _ => Ok(None),
-    }
-}
-
-fn etherip_payload(payload: &[u8]) -> Option<&[u8]> {
-    payload.strip_prefix(&ETHERIP_HEADER)
-}
-
-#[derive(Debug, PartialEq)]
-enum OuterError {
-    Short,
-    EtherType,
-    Version,
-    Length,
-    Protocol,
-    Source,
-    Destination,
-}
-
-fn valid_outer_packet(packet: &[u8], tunnel: &Tunnel) -> Result<(), OuterError> {
-    if packet.len() < 54 {
-        return Err(OuterError::Short);
-    }
-    if u16::from_be_bytes([packet[12], packet[13]]) != ETHER_TYPE_IPV6 {
-        return Err(OuterError::EtherType);
-    }
-    if packet[14] >> 4 != 6 {
-        return Err(OuterError::Version);
-    }
-    let payload_length = u16::from_be_bytes([packet[18], packet[19]]) as usize;
-    if packet.len() < 54 + payload_length {
-        return Err(OuterError::Length);
-    }
-    if packet[20] != NEXT_ETHERIP && packet[20] != NEXT_FRAGMENT {
-        return Err(OuterError::Protocol);
-    }
-    if packet[22..38] != tunnel.remote_ipv6.octets() {
-        return Err(OuterError::Source);
-    }
-    if packet[38..54] != tunnel.local_ipv6.octets() {
-        return Err(OuterError::Destination);
-    }
-    Ok(())
-}
-
-type FragmentKey = ([u8; 16], [u8; 16], u32);
-
-struct MacTable {
-    remote: HashMap<[u8; 6], Instant>,
-    next_expiry: Instant,
-}
-
-impl Default for MacTable {
-    fn default() -> Self {
-        Self {
-            remote: HashMap::new(),
-            next_expiry: Instant::now() + MAC_AGE,
-        }
-    }
-}
-
-impl MacTable {
-    fn learn_source(&mut self, frame: &[u8]) {
-        if let Some(source) = source_mac(frame)
-            && source[0] & 1 == 0
-        {
-            self.remote.insert(source, Instant::now());
-        }
-    }
-
-    fn contains_source(&self, frame: &[u8]) -> bool {
-        source_mac(frame).is_some_and(|source| {
-            self.remote
-                .get(&source)
-                .is_some_and(|seen| seen.elapsed() < MAC_AGE)
-        })
-    }
-
-    fn expire(&mut self) {
-        if Instant::now() >= self.next_expiry {
-            self.remote.retain(|_, seen| seen.elapsed() < MAC_AGE);
-            self.next_expiry = Instant::now() + MAC_AGE;
-        }
-    }
-}
-
-fn source_mac(frame: &[u8]) -> Option<[u8; 6]> {
-    frame.get(6..12)?.try_into().ok()
-}
-
-#[derive(Default)]
-struct Reassembly {
-    packets: HashMap<FragmentKey, Partial>,
-}
-struct Partial {
-    updated: Instant,
-    total: Option<usize>,
-    fragments: Vec<(usize, Vec<u8>)>,
-}
-
-impl Reassembly {
-    fn insert(
-        &mut self,
-        key: FragmentKey,
-        offset: usize,
-        more: bool,
-        data: &[u8],
-    ) -> Option<Vec<u8>> {
-        if (more && !data.len().is_multiple_of(8)) || offset.checked_add(data.len())? > MAX_PACKET {
-            self.packets.remove(&key);
-            return None;
-        }
-        // ponytail: fixed limits prevent fragment-memory exhaustion; make configurable if real traffic hits them.
-        if self.packets.len() >= 1024 && !self.packets.contains_key(&key) {
-            return None;
-        }
-        let partial = self.packets.entry(key).or_insert_with(|| Partial {
-            updated: Instant::now(),
-            total: None,
-            fragments: Vec::new(),
-        });
-        if partial.fragments.len() >= 128 {
-            self.packets.remove(&key);
-            return None;
-        }
-        let end = offset + data.len();
-        if partial
-            .fragments
-            .iter()
-            .any(|(start, bytes)| offset < start + bytes.len() && *start < end)
-        {
-            self.packets.remove(&key);
-            return None;
-        }
-        partial.updated = Instant::now();
-        if !more {
-            partial.total = Some(end);
-        }
-        partial.fragments.push((offset, data.to_vec()));
-        partial.fragments.sort_unstable_by_key(|part| part.0);
-        let end = partial
-            .fragments
-            .iter()
-            .try_fold(0, |next, (offset, bytes)| {
-                (*offset == next).then_some(next + bytes.len())
-            });
-        if let Some(total) = partial.total.filter(|&total| end == Some(total)) {
-            let mut result = Vec::with_capacity(total);
-            for (_, bytes) in &partial.fragments {
-                result.extend_from_slice(bytes);
-            }
-            self.packets.remove(&key);
-            return Some(result);
-        }
-        None
-    }
-
-    fn expire(&mut self) {
-        self.packets
-            .retain(|_, packet| packet.updated.elapsed() < Duration::from_secs(60));
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::{Config, Tunnel, TunnelSpec, build_tunnels, parse_tunnel, split_args};
+    use crate::etherip::{
+        etherip_payload, fragment_packets, ipv6_packet, tunnel_for_lan_frame, tunnel_index_for_wan,
+        valid_outer_packet,
+    };
+    use crate::mac_table::MacTable;
+    use crate::ndp::{icmpv6_checksum, ndp_advertisement};
+    use crate::protocol::{ETHER_TYPE_IPV6, NEXT_ETHERIP, NEXT_ICMPV6};
+    use crate::reassembly::Reassembly;
+    use clap::Parser;
+    use std::net::Ipv6Addr;
 
     fn config(mtu: usize) -> Config {
         Config {
@@ -923,7 +315,7 @@ mod tests {
         let checksum = icmpv6_checksum(&source_ip, &destination_ip, &request[54..]);
         request[56..58].copy_from_slice(&checksum.to_be_bytes());
 
-        let reply = ndp_advertisement(&request, &config, local_mac).unwrap();
+        let reply = ndp_advertisement(&request, config.local_ipv6, local_mac).unwrap();
         assert_eq!(&reply[..6], &source_mac);
         assert_eq!(&reply[6..12], &local_mac);
         assert_eq!(&reply[22..38], &target);
