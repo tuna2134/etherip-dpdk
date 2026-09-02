@@ -17,6 +17,7 @@ void dpdk_pktmbuf_free(struct rte_mbuf *packet);
 void *dpdk_pktmbuf_append(struct rte_mbuf *packet, uint16_t length);
 void *dpdk_pktmbuf_prepend(struct rte_mbuf *packet, uint16_t length);
 void *dpdk_pktmbuf_adj(struct rte_mbuf *packet, uint16_t length);
+int dpdk_pktmbuf_trim(struct rte_mbuf *packet, uint16_t length);
 void *dpdk_mbuf_data(struct rte_mbuf *packet);
 uint32_t dpdk_mbuf_packet_length(const struct rte_mbuf *packet);
 uint16_t dpdk_mbuf_data_length(const struct rte_mbuf *packet);

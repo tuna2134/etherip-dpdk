@@ -34,6 +34,10 @@ void *dpdk_pktmbuf_adj(struct rte_mbuf *packet, uint16_t length) {
     return rte_pktmbuf_adj(packet, length);
 }
 
+int dpdk_pktmbuf_trim(struct rte_mbuf *packet, uint16_t length) {
+    return rte_pktmbuf_trim(packet, length);
+}
+
 void *dpdk_mbuf_data(struct rte_mbuf *packet) {
     return rte_pktmbuf_mtod(packet, void *);
 }

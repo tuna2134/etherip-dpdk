@@ -13,9 +13,12 @@ LAN A ─ LAN port [ endpoint A ] WAN port ══ IPv6 ══ WAN port [ endpoin
 
 - RFC 3378 EtherIP version 3のカプセル化・デカプセル化
 - Ethernet/IEEE 802.3フレームの転送（FCSを除く）
+- 複数トンネル対応: 繰り返し指定できる`--tunnel`で複数の対向endpointを定義し、
+  LAN側のVLAN IDで対応するトンネルを選択。タグを外してカプセル化し、受信時に
+  付与し直す（トンネル内はクリーンなEthernetフレームになる）
 - IPv6 Fragment Headerによる送信fragment化
 - 順不同fragmentの再構成、重複fragmentの破棄、60秒のタイムアウト
-- 対向から学習した送信元MACによる反射ループ抑止（保持時間5分）
+- 対向から学習した送信元MACによる反射ループ抑止（保持時間5分）。学習はトンネルごと
 - WAN側local IPv6アドレスへのNDP Neighbor Solicitation応答
 - bindgenでDPDK Cヘッダーから生成したRust FFIと、安全な最小Rust API
 - burst RX/TXと`rte_mbuf`所有権移譲による通常パスのzero-copy転送
@@ -132,9 +135,10 @@ EtherIPオプション:
 | `--lan-port <ID>` | yes | ブリッジ対象LANへ接続したDPDKポート |
 | `--wan-port <ID>` | yes | 外側IPv6パケットを送受信するDPDKポート |
 | `--local-ipv6 <ADDR>` | yes | 外側IPv6ヘッダーの送信元アドレス |
-| `--remote-ipv6 <ADDR>` | yes | 対向EtherIP endpointのIPv6アドレス |
-| `--next-hop-mac <MAC>` | yes | WAN側IPv6 next hopのMACアドレス |
-| `--mtu <BYTES>` | no | 外側IPv6 MTU。既定値1500、範囲70～65575 |
+| `--remote-ipv6 <ADDR>` | one* | 単一トンネル時の対向EtherIP endpointのIPv6アドレス |
+| `--next-hop-mac <MAC>` | one* | 単一トンネル時のWAN側IPv6 next hopのMACアドレス |
+| `--tunnel <VLAN>:<REMOTE>:<MAC>[:<MTU>]` | many* | 複数トンネルを1本ずつ追加。`*`は単一トンネル（`--remote-ipv6`/`--next-hop-mac`）か`--tunnel`のどちらか一方を使う |
+| `--mtu <BYTES>` | no | 外側IPv6 MTU。既定値1500、範囲70～65575。`--tunnel`側で個別上書き可 |
 | `--rx-queue <ID>` | no | 両ポートで使うRX queue。既定値0 |
 | `--tx-queue <ID>` | no | 両ポートで使うTX queue。既定値0 |
 | `--rx-descriptors <N>` | no | queueごとのRX descriptor数。既定値1024 |
@@ -145,6 +149,15 @@ EtherIPオプション:
 `--next-hop-mac`には、対向が同一L2セグメントなら対向WANポートのMAC、
 ルーター越しならnext-hopルーターのMACを指定します。本プログラムは自身の
 `--local-ipv6`に対するNDPへ応答しますが、next hopのNDP探索や経路探索は行いません。
+
+### 単一トンネルと複数トンネル
+
+`--remote-ipv6`/`--next-hop-mac`を指定した場合は従来どおり単一トンネルとして動作し、
+LAN側のVLANフレームはタグ付きのままトンネルへ渡します。`--tunnel`を1本以上指定した
+場合は複数トンネルモードになり、LANフレームのVLAN ID（802.1Q）でトンネルを選択します。
+選択されたフレームはタグを外してカプセル化され、トンネルから受信したフレームには
+対応するトンネルのVLANタグが付与されてLANへ出ます。VLAN IDは1～4094で、重複は
+許可されません。
 
 ## 2拠点の設定例
 
@@ -180,23 +193,48 @@ sudo target/release/etherip \
 PCIアドレス、DPDK port ID、IPv6アドレス、MACアドレスは環境に合わせて
 置き換えてください。両endpointのlocal/remote IPv6は互いに逆の組にします。
 
+### 複数トンネルの設定例
+
+1つのendpointから複数の拠点へ、VLAN IDでトンネルを分けてブリッジする例です。
+対向ごとに`--tunnel`を1つ指定します。
+
+```bash
+sudo target/release/etherip \
+  -l 0 -a 0000:01:00.0 -a 0000:02:00.0 -- \
+  --lan-port 0 \
+  --wan-port 1 \
+  --local-ipv6 2001:db8:1::1 \
+  --tunnel 100:2001:db8:1::2:02:00:00:00:00:02 \
+  --tunnel 200:2001:db8:1::3:02:00:00:00:00:03 \
+  --mtu 1500
+```
+
+LAN側でVLAN 100のタグが付いたフレームは`2001:db8:1::2`へ、VLAN 200は
+`2001:db8:1::3`へのトンネルで転送されます。タグなしのフレームは破棄されます。
+対向側も同様に`--tunnel`を設定し、VLAN IDを両端で合わせてください（例えば
+endpoint Bは`--tunnel 100:2001:db8:1::1:...`）。
+
 ## パケット処理
 
 LANからWAN方向:
 
 1. LANポートでEthernetフレームを受信する。
-2. 対向から戻ってきた送信元MACなら、反射ループとして破棄する。
-3. `0x3000`のEtherIP v3ヘッダーを付ける。
-4. IPv6 MTU以内ならNext Header 97で送信する。
-5. MTUを超える場合はIPv6 Fragment Headerを付け、8-byte境界で分割する。
+2. 複数トンネルモードではVLAN IDでトンネルを選択し、802.1Qタグを外す。
+   単一トンネルモードではVLAN処理は行わない。
+3. 対向から戻ってきた送信元MACなら、反射ループとして破棄する（トンネルごとに学習）。
+4. `0x3000`のEtherIP v3ヘッダーを付ける。
+5. IPv6 MTU以内ならNext Header 97で送信する。
+6. MTUを超える場合はIPv6 Fragment Headerを付け、8-byte境界で分割する。
 
 WANからLAN方向:
 
-1. 宛先・送信元IPv6が設定と一致するパケットだけを受け付ける。
+1. 宛先・送信元IPv6が設定と一致するパケットだけを受け付ける。複数トンネル
+   モードでは送信元IPv6でトンネルを特定する。
 2. 必要ならfragmentを再構成する。
 3. EtherIP version 3かつreserved bitsが0であることを検証する。
-4. 内側Ethernetフレームの送信元MACを学習する。
-5. 元のフレームをLANポートへ送信する。
+4. 内側Ethernetフレームの送信元MACを学習する（トンネルごと）。
+5. 複数トンネルモードでは対応するVLANタグを付与する。
+6. 元のフレームをLANポートへ送信する。
 
 通常パスでは受信した`rte_mbuf`へ外側headerをprepend、または受信headerをadjustし、
 ユーザーバッファへコピーせずburst送信します。IPv6 fragmentの生成と再構成だけは、
@@ -209,7 +247,8 @@ mbufの所有権はDPDKへ移り、一部しか受理しなかった場合は未
 この実装は、対向から届いた内側フレームの送信元MACを5分間記録します。同じ
 送信元MACのフレームがLANポートから戻った場合、トンネルへ再送しません。これは
 ポイントツーポイント構成での単純な反射ループを抑えるための学習であり、転送先を
-選択する一般的な学習ブリッジではありません。
+選択する一般的な学習ブリッジではありません。学習テーブルはトンネルごとに独立して
+おり、VLAN 100のトンネルで学習したMACはVLAN 200のトンネルでは抑止されません。
 
 RFC 3378自体にはhop countやループ防止機構がありません。複数のEtherIP経路、
 並列リンク、外部ブリッジを含むトポロジーでは、この抑止だけでブロードキャスト
@@ -223,7 +262,8 @@ RFC 3378自体にはhop countやループ防止機構がありません。複数
   firewallで必要な対向だけに制限してください。
 - 機密性や改ざん防止が必要なら外側IPv6通信をIPsecなどで保護してください。
 - IPv6拡張ヘッダーは、IPv6ヘッダー直後のFragment Headerだけに対応します。
-- VLANフレームはそのまま転送しますが、VLAN別のフィルタリングは行いません。
+- 複数トンネルモードではLANフレームのVLAN IDでトンネルを選択し、タグを外して
+  転送します。VLAN IDは12bitのVIDだけを判定し、PCP/DEIは設定・保存しません。
 - next hopのNDP探索、IPv6 routing、Path MTU Discovery、NDP以外のICMPv6生成は実装していません。
 - fragment再構成は最大1024パケット、1パケット最大128 fragmentに制限しています。
 - DPDKポートはpromiscuous modeで動作します。

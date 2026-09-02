@@ -368,7 +368,14 @@ impl Packet {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid mbuf adjustment"))
     }
 
-    fn append(&mut self, length: usize) -> io::Result<&mut [u8]> {
+    pub fn trim_tail(&mut self, length: usize) -> io::Result<()> {
+        let length = packet_length(length)?;
+        // SAFETY: the packet is live; DPDK rejects trimming beyond the packet length.
+        check(unsafe { ffi::dpdk_pktmbuf_trim(self.as_ptr(), length) })?;
+        Ok(())
+    }
+
+    pub fn append(&mut self, length: usize) -> io::Result<&mut [u8]> {
         let length = packet_length(length)?;
         // SAFETY: the packet is live; DPDK checks available tailroom.
         let data = unsafe { ffi::dpdk_pktmbuf_append(self.as_ptr(), length) };
