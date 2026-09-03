@@ -6,7 +6,10 @@ use crate::{
     reassembly::Reassembly,
 };
 use dpdk::{Environment, Packet};
-use std::io;
+use std::{
+    io,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use tracing::debug;
 
 /// Selects the tunnel for a LAN-side frame. The legacy single tunnel accepts every
@@ -65,21 +68,22 @@ pub fn add_vlan_tag(packet: &mut Packet, vlan: u16) -> io::Result<()> {
 }
 
 /// Wraps a LAN frame as an EtherIP packet, prepending the outer header in place or
-/// producing IPv6 fragments when the frame exceeds the tunnel MTU. Resulting
+/// producing IPv6 fragments when the frame exceeds the current path MTU. Resulting
 /// packets are appended to `out` to avoid per-packet allocations.
 pub fn encapsulate_packet(
     mut packet: Packet,
     dpdk: &Environment,
     tunnel: &Tunnel,
+    mtu: usize,
     source_mac: [u8; 6],
-    id: &mut u32,
+    id: &AtomicU32,
     out: &mut Vec<Packet>,
 ) -> io::Result<()> {
     let frame = packet
         .data()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "multi-segment LAN packet"))?;
     let frame_length = frame.len();
-    if 40 + ETHERIP_HEADER.len() + frame_length <= tunnel.mtu {
+    if 40 + ETHERIP_HEADER.len() + frame_length <= mtu {
         let header = packet.prepend(56)?;
         write_outer_header(header, tunnel, source_mac, NEXT_ETHERIP, frame_length + 2);
         header[54..56].copy_from_slice(&ETHERIP_HEADER);
@@ -87,7 +91,7 @@ pub fn encapsulate_packet(
         out.push(packet);
         return Ok(());
     }
-    let fragments = fragment_packets(frame, tunnel, source_mac, id)?;
+    let fragments = fragment_packets(frame, tunnel, mtu, source_mac, id)?;
     debug!(
         frame_length,
         fragments = fragments.len(),
@@ -102,8 +106,9 @@ pub fn encapsulate_packet(
 pub fn fragment_packets(
     frame: &[u8],
     tunnel: &Tunnel,
+    mtu: usize,
     source_mac: [u8; 6],
-    id: &mut u32,
+    id: &AtomicU32,
 ) -> io::Result<Vec<Vec<u8>>> {
     let mut payload = Vec::with_capacity(frame.len() + 2);
     payload.extend_from_slice(&ETHERIP_HEADER);
@@ -114,8 +119,7 @@ pub fn fragment_packets(
             "EtherIP payload exceeds the IPv6 payload limit",
         ));
     }
-    let chunk = ((tunnel
-        .mtu
+    let chunk = ((mtu
         .checked_sub(40 + 8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MTU too small"))?)
         / 8)
@@ -126,7 +130,7 @@ pub fn fragment_packets(
             "EtherIP frame cannot be fragmented for this MTU",
         ));
     }
-    *id = id.wrapping_add(1);
+    let id = id.fetch_add(1, Ordering::Relaxed);
     Ok(payload
         .chunks(chunk)
         .enumerate()

@@ -1,12 +1,11 @@
 //! Safe ownership and burst-oriented access to the DPDK C API.
 
 use std::{
-    cell::RefCell,
     ffi::CString,
     io,
     ptr::{self, NonNull},
-    rc::Rc,
     slice,
+    sync::{Arc, Mutex},
 };
 
 #[allow(
@@ -43,12 +42,20 @@ impl Default for MempoolConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PortConfig {
+    /// RX queue used in single-worker mode.
     pub rx_queue: u16,
+    /// TX queue used in single-worker mode.
     pub tx_queue: u16,
+    /// Total number of RX queues to configure.
+    pub rx_queues: u16,
+    /// Total number of TX queues to configure.
+    pub tx_queues: u16,
     pub rx_descriptors: u16,
     pub tx_descriptors: u16,
     pub socket_id: Option<u32>,
     pub promiscuous: bool,
+    /// Enable RSS so ingress packets are spread across the RX queues.
+    pub rss: bool,
 }
 
 impl Default for PortConfig {
@@ -56,23 +63,44 @@ impl Default for PortConfig {
         Self {
             rx_queue: 0,
             tx_queue: 0,
+            rx_queues: 1,
+            tx_queues: 1,
             rx_descriptors: 1024,
             tx_descriptors: 1024,
             socket_id: None,
             promiscuous: true,
+            rss: false,
         }
     }
 }
 
+/// Hash functions requested for RSS. Values match DPDK's `RTE_ETH_RSS_*` bitmask:
+/// distribute IPv4/IPv6 traffic, including fragmented packets and L4 flows.
+const RSS_MASK: u64 = (1 << 0) // RTE_ETH_RSS_IPV4
+    | (1 << 1) // RTE_ETH_RSS_FRAG_IPV4
+    | (1 << 2) // RTE_ETH_RSS_NONFRAG_IPV4_TCP
+    | (1 << 3) // RTE_ETH_RSS_NONFRAG_IPV4_UDP
+    | (1 << 5) // RTE_ETH_RSS_NONFRAG_IPV4_OTHER
+    | (1 << 6) // RTE_ETH_RSS_IPV6
+    | (1 << 7) // RTE_ETH_RSS_FRAG_IPV6
+    | (1 << 8) // RTE_ETH_RSS_NONFRAG_IPV6_TCP
+    | (1 << 9) // RTE_ETH_RSS_NONFRAG_IPV6_UDP
+    | (1 << 11); // RTE_ETH_RSS_NONFRAG_IPV6_OTHER
+
 pub struct Environment {
-    pool: Rc<Pool>,
+    pool: Arc<Pool>,
 }
 
 struct Pool(NonNull<ffi::rte_mempool>);
 
+// SAFETY: the pool is only accessed through DPDK mempool functions, which are
+// thread-safe. Sharing it across workers is safe.
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {}
+
 impl Drop for Pool {
     fn drop(&mut self) {
-        // SAFETY: Rc ensures that no Port or Packet using this pool remains.
+        // SAFETY: Arc ensures that no Port or Packet using this pool remains.
         unsafe { ffi::rte_mempool_free(self.0.as_ptr()) }
     }
 }
@@ -120,7 +148,7 @@ impl Environment {
         let pool = NonNull::new(pool).ok_or_else(last_error)?;
         Ok((
             Self {
-                pool: Rc::new(Pool(pool)),
+                pool: Arc::new(Pool(pool)),
             },
             consumed as usize,
         ))
@@ -142,17 +170,16 @@ impl Environment {
                 "DPDK port does not exist",
             ));
         }
-        let rx_queue_count = config.rx_queue.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "RX queue ID is too large")
-        })?;
-        let tx_queue_count = config.tx_queue.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "TX queue ID is too large")
-        })?;
-        // SAFETY: all-zero rte_eth_conf is DPDK's documented default configuration.
-        let eth_config = unsafe { std::mem::zeroed::<ffi::rte_eth_conf>() };
+        let rx_queues = config.rx_queues.max(1);
+        let tx_queues = config.tx_queues.max(1);
+        let mut eth_config = unsafe { std::mem::zeroed::<ffi::rte_eth_conf>() };
+        if config.rss && rx_queues > 1 {
+            eth_config.rxmode.mq_mode = ffi::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
+            eth_config.rx_adv_conf.rss_conf.rss_hf = RSS_MASK;
+        }
         // SAFETY: id is valid and eth_config remains live for the call.
         check(unsafe {
-            ffi::rte_eth_dev_configure(id, rx_queue_count, tx_queue_count, &raw const eth_config)
+            ffi::rte_eth_dev_configure(id, rx_queues, tx_queues, &raw const eth_config)
         })?;
 
         let result = (|| {
@@ -165,7 +192,7 @@ impl Environment {
                     socket as u32
                 }
             };
-            for queue in 0..rx_queue_count {
+            for queue in 0..rx_queues {
                 // SAFETY: port, queue, pool and descriptor arguments are valid for queue setup.
                 check(unsafe {
                     ffi::rte_eth_rx_queue_setup(
@@ -178,7 +205,7 @@ impl Environment {
                     )
                 })?;
             }
-            for queue in 0..tx_queue_count {
+            for queue in 0..tx_queues {
                 // SAFETY: port, queue and descriptor arguments are valid for queue setup.
                 check(unsafe {
                     ffi::rte_eth_tx_queue_setup(
@@ -205,27 +232,78 @@ impl Environment {
         }
         Ok(Port {
             id,
-            rx_queue: config.rx_queue,
-            tx_queue: config.tx_queue,
-            pool: Rc::clone(&self.pool),
-            rx_scratch: RefCell::new(Vec::new()),
-            tx_scratch: RefCell::new(Vec::new()),
+            rx_queues,
+            tx_queues,
+            pool: Arc::clone(&self.pool),
+            rx_scratch: (0..rx_queues).map(|_| Mutex::new(Vec::new())).collect(),
+            tx_scratch: (0..tx_queues).map(|_| Mutex::new(Vec::new())).collect(),
         })
     }
 
     pub fn packet(&self, bytes: &[u8]) -> io::Result<Packet> {
-        Packet::from_bytes(Rc::clone(&self.pool), bytes)
+        Packet::from_bytes(Arc::clone(&self.pool), bytes)
     }
+}
+
+/// Number of lcores enabled in the EAL core mask.
+pub fn lcore_count() -> u32 {
+    // SAFETY: EAL is initialized.
+    unsafe { ffi::rte_lcore_count() }
+}
+
+/// Iterates over the non-main lcores, returning `None` when the mask is exhausted.
+pub fn next_lcore(previous: Option<u32>) -> Option<u32> {
+    // LCORE_ID_ANY (UINT32_MAX, i.e. -1 as an int) requests the first lcore.
+    let previous = previous.unwrap_or(u32::MAX);
+    // SAFETY: EAL is initialized and `previous` is a valid starting point.
+    let next = unsafe { ffi::rte_get_next_lcore(previous, 1, 0) };
+    (next < ffi::RTE_MAX_LCORE).then_some(next)
+}
+
+/// Runs `run` to completion on a worker lcore, blocking until it returns.
+pub fn launch_on_lcore<F>(lcore: u32, run: F) -> io::Result<()>
+where
+    F: FnOnce() -> i32 + Send + 'static,
+{
+    unsafe extern "C" fn trampoline<F: FnOnce() -> i32>(arg: *mut std::ffi::c_void) -> i32 {
+        // SAFETY: launch_on_lcore leaked a Box<F> as the argument.
+        let run = unsafe { Box::from_raw(arg.cast::<F>()) };
+        run()
+    }
+    let arg = Box::into_raw(Box::new(run)).cast::<std::ffi::c_void>();
+    let f: ffi::lcore_function_t = Some(trampoline::<F>);
+    // SAFETY: `arg` is a live leaked Box<F> and `f` is a valid trampoline for it.
+    let rc = unsafe { ffi::rte_eal_remote_launch(f, arg, lcore) };
+    if rc < 0 {
+        // SAFETY: the launch failed, so the box was not consumed by the worker.
+        drop(unsafe { Box::from_raw(arg.cast::<F>()) });
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Blocks until the worker on `lcore` has returned.
+pub fn wait_on_lcore(lcore: u32) -> io::Result<()> {
+    // SAFETY: the lcore was launched and is not the main lcore.
+    check(unsafe { ffi::rte_eal_wait_lcore(lcore) })?;
+    Ok(())
 }
 
 pub struct Port {
     id: u16,
-    rx_queue: u16,
-    tx_queue: u16,
-    pool: Rc<Pool>,
-    rx_scratch: RefCell<Vec<*mut ffi::rte_mbuf>>,
-    tx_scratch: RefCell<Vec<*mut ffi::rte_mbuf>>,
+    rx_queues: u16,
+    tx_queues: u16,
+    pool: Arc<Pool>,
+    rx_scratch: Vec<Mutex<Vec<*mut ffi::rte_mbuf>>>,
+    tx_scratch: Vec<Mutex<Vec<*mut ffi::rte_mbuf>>>,
 }
+
+// SAFETY: the scratch buffers hold temporary DPDK burst pointers, are protected by
+// a Mutex per queue, and are emptied after each burst. Each queue is only ever
+// touched by the worker that owns it, and the NIC and mempool accesses are
+// thread-safe. Sharing a Port across workers is therefore safe.
+unsafe impl Send for Port {}
+unsafe impl Sync for Port {}
 
 impl Port {
     pub fn mac(&self) -> io::Result<[u8; 6]> {
@@ -236,32 +314,32 @@ impl Port {
         Ok(address.addr_bytes)
     }
 
-    pub fn receive_burst(&self, count: u16) -> io::Result<Vec<Packet>> {
-        let mut packets = Vec::with_capacity(usize::from(count));
-        self.receive_burst_into(&mut packets, count)?;
-        Ok(packets)
-    }
-
-    pub fn receive_burst_into(&self, packets: &mut Vec<Packet>, count: u16) -> io::Result<()> {
+    pub fn receive_burst_into(
+        &self,
+        queue: u16,
+        packets: &mut Vec<Packet>,
+        count: u16,
+    ) -> io::Result<()> {
         validate_burst(count)?;
+        validate_queue(queue, self.rx_queues)?;
         packets.clear();
         packets.reserve(usize::from(count));
-        let mut pointers = self.rx_scratch.borrow_mut();
-        pointers.resize(usize::from(count), ptr::null_mut());
-        // SAFETY: pointers has count writable entries and the RX queue is configured.
-        let received =
-            unsafe { ffi::dpdk_rx_burst(self.id, self.rx_queue, pointers.as_mut_ptr(), count) };
-        for &pointer in &pointers[..usize::from(received)] {
+        let mut scratch = self.rx_scratch[usize::from(queue)].lock().unwrap();
+        scratch.resize(usize::from(count), ptr::null_mut());
+        // SAFETY: scratch has count writable entries and the RX queue is configured.
+        let received = unsafe { ffi::dpdk_rx_burst(self.id, queue, scratch.as_mut_ptr(), count) };
+        for &pointer in &scratch[..usize::from(received)] {
             packets.push(Packet {
                 pointer: Some(NonNull::new(pointer).expect("DPDK returned a null mbuf")),
-                _pool: Rc::clone(&self.pool),
+                _pool: Arc::clone(&self.pool),
             });
         }
         Ok(())
     }
 
     /// Transfers ownership of the successfully transmitted prefix to DPDK.
-    pub fn send_burst(&self, packets: &mut [Packet]) -> io::Result<usize> {
+    pub fn send_burst(&self, queue: u16, packets: &mut [Packet]) -> io::Result<usize> {
+        validate_queue(queue, self.tx_queues)?;
         let count = u16::try_from(packets.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -271,12 +349,11 @@ impl Port {
         if count == 0 {
             return Ok(0);
         }
-        let mut pointers = self.tx_scratch.borrow_mut();
-        pointers.clear();
-        pointers.extend(packets.iter().map(Packet::as_ptr));
+        let mut scratch = self.tx_scratch[usize::from(queue)].lock().unwrap();
+        scratch.clear();
+        scratch.extend(packets.iter().map(Packet::as_ptr));
         // SAFETY: every pointer is owned by the corresponding Packet until this call succeeds.
-        let sent =
-            unsafe { ffi::dpdk_tx_burst(self.id, self.tx_queue, pointers.as_mut_ptr(), count) };
+        let sent = unsafe { ffi::dpdk_tx_burst(self.id, queue, scratch.as_mut_ptr(), count) };
         for packet in &mut packets[..usize::from(sent)] {
             packet.pointer.take();
         }
@@ -296,12 +373,12 @@ impl Drop for Port {
 
 pub struct Packet {
     pointer: Option<NonNull<ffi::rte_mbuf>>,
-    _pool: Rc<Pool>,
+    _pool: Arc<Pool>,
 }
 
 impl Packet {
-    fn from_bytes(pool: Rc<Pool>, bytes: &[u8]) -> io::Result<Self> {
-        // SAFETY: pool remains alive through the Rc stored in Packet.
+    fn from_bytes(pool: Arc<Pool>, bytes: &[u8]) -> io::Result<Self> {
+        // SAFETY: pool remains alive through the Arc stored in Packet.
         let pointer = unsafe { ffi::dpdk_pktmbuf_alloc(pool.0.as_ptr()) };
         let mut packet = Self {
             pointer: Some(
@@ -413,6 +490,15 @@ fn validate_burst(count: u16) -> io::Result<()> {
                 "RX burst must be a non-zero multiple of 8",
             )
         })
+}
+
+fn validate_queue(queue: u16, count: u16) -> io::Result<()> {
+    (queue < count).then_some(()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "queue ID is not configured on this port",
+        )
+    })
 }
 
 fn packet_length(length: usize) -> io::Result<u16> {

@@ -85,6 +85,10 @@ pub struct Config {
     /// Number of packets requested from each RX burst (multiple of 8).
     #[arg(long, default_value_t = 64, value_parser = parse_burst_size)]
     pub burst_size: u16,
+
+    /// Number of worker lcores. Each worker owns one RSS queue pair on both ports.
+    #[arg(long, default_value_t = 1, value_parser = parse_workers)]
+    pub workers: u16,
 }
 
 /// Splits process arguments into DPDK EAL options and application options.
@@ -210,4 +214,11 @@ fn parse_burst_size(value: &str) -> Result<u16, String> {
         .is_multiple_of(8)
         .then_some(value)
         .ok_or_else(|| "burst size must be a multiple of 8".into())
+}
+
+fn parse_workers(value: &str) -> Result<u16, String> {
+    let workers: u16 = value.parse().map_err(|_| "workers must be an integer")?;
+    (workers != 0 && workers.is_power_of_two())
+        .then_some(workers)
+        .ok_or_else(|| "workers must be a non-zero power of two".into())
 }

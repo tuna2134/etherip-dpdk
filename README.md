@@ -17,9 +17,11 @@ LAN A ─ LAN port [ endpoint A ] WAN port ══ IPv6 ══ WAN port [ endpoin
   LAN側のVLAN IDで対応するトンネルを選択。タグを外してカプセル化し、受信時に
   付与し直す（トンネル内はクリーンなEthernetフレームになる）
 - IPv6 Fragment Headerによる送信fragment化
+- ICMPv6 Packet Too BigによるパスMTUの学習（PMTUD）と、それに追従したfragment化
 - 順不同fragmentの再構成、重複fragmentの破棄、60秒のタイムアウト
 - 対向から学習した送信元MACによる反射ループ抑止（保持時間5分）。学習はトンネルごと
 - WAN側local IPv6アドレスへのNDP Neighbor Solicitation応答
+- multi-queue + RSS + worker-per-lcoreによる並列転送（`--workers`）
 - bindgenでDPDK Cヘッダーから生成したRust FFIと、安全な最小Rust API
 - burst RX/TXと`rte_mbuf`所有権移譲による通常パスのzero-copy転送
 
@@ -139,12 +141,13 @@ EtherIPオプション:
 | `--next-hop-mac <MAC>` | one* | 単一トンネル時のWAN側IPv6 next hopのMACアドレス |
 | `--tunnel <VLAN>,<REMOTE>,<MAC>[,<MTU>]` | many* | 複数トンネルを1本ずつ追加。`*`は単一トンネル（`--remote-ipv6`/`--next-hop-mac`）か`--tunnel`のどちらか一方を使う |
 | `--mtu <BYTES>` | no | 外側IPv6 MTU。既定値1500、範囲70～65575。`--tunnel`側で個別上書き可 |
-| `--rx-queue <ID>` | no | 両ポートで使うRX queue。既定値0 |
-| `--tx-queue <ID>` | no | 両ポートで使うTX queue。既定値0 |
+| `--rx-queue <ID>` | no | 単一worker時(`--workers 1`)のRX queue。既定値0 |
+| `--tx-queue <ID>` | no | 単一worker時(`--workers 1`)のTX queue。既定値0 |
 | `--rx-descriptors <N>` | no | queueごとのRX descriptor数。既定値1024 |
 | `--tx-descriptors <N>` | no | queueごとのTX descriptor数。既定値1024 |
 | `--socket-id <ID>` | no | mempoolとqueueのNUMA socket。省略時はDPDKが選択 |
 | `--burst-size <N>` | no | RX burst数。8の倍数、既定値64 |
+| `--workers <N>` | no | worker lcore数（1/2/4/8...の2のべき乗）。既定値1。2以上でRSS有効化 |
 
 `--next-hop-mac`には、対向が同一L2セグメントなら対向WANポートのMAC、
 ルーター越しならnext-hopルーターのMACを指定します。本プログラムは自身の
@@ -158,6 +161,30 @@ LAN側のVLANフレームはタグ付きのままトンネルへ渡します。`
 選択されたフレームはタグを外してカプセル化され、トンネルから受信したフレームには
 対応するトンネルのVLANタグが付与されてLANへ出ます。VLAN IDは1～4094で、重複は
 許可されません。
+
+### 複数ワーカー（RSS）とPMTUD
+
+`--workers`を2以上の2のべき乗にすると、両ポートでその数のRX/TX queueを設定し、
+**RSS**で受信パケットをqueueへ分散します。各workerは`rte_eal_remote_launch`で
+`-l`で指定したlcoreの1つに固定され、自分のqueueペアを専有して転送します。
+EALの`-l`にはmain lcoreを含め `workers + 1` 個以上のlcoreが必要です。
+
+```bash
+sudo target/release/etherip \
+  -l 0,1,2,3 -a 0000:01:00.0 -a 0000:02:00.0 -- \
+  --lan-port 0 --wan-port 1 --local-ipv6 2001:db8::1 \
+  --tunnel 100,2001:db8::2,02:00:00:00:00:02 \
+  --workers 4
+```
+
+worker間で共有する状態（MAC学習テーブル、fragment再構成、fragment ID、パスMTU）は
+RwLock/Mutex/Atomicで保護されます。RSSはIPv6 fragment IDまで含めてハッシュするため、
+同一パケットのfragmentは同じqueueへ届きます。
+
+**PMTUD**: WAN側で自アドレス宛のICMPv6 Packet Too Big（type 2）を受信すると、
+埋め込まれた元パケットの宛先（=対向）からトンネルを特定し、そのトンネルの
+**パスMTU**を報告された値へ引き下げます（下限1280、再上昇はしません）。
+以降のfragment化はこのパスMTUを使うため、経路上のMTU変動に追従します。
 
 ## 2拠点の設定例
 
@@ -218,19 +245,20 @@ endpoint Bは`--tunnel 100,2001:db8:1::1,...`）。
 
 LANからWAN方向:
 
-1. LANポートでEthernetフレームを受信する。
+1. LANポートでEthernetフレームを受信する。`--workers`が2以上ならRSSでqueueへ分散。
 2. 複数トンネルモードではVLAN IDでトンネルを選択し、802.1Qタグを外す。
    単一トンネルモードではVLAN処理は行わない。
 3. 対向から戻ってきた送信元MACなら、反射ループとして破棄する（トンネルごとに学習）。
 4. `0x3000`のEtherIP v3ヘッダーを付ける。
-5. IPv6 MTU以内ならNext Header 97で送信する。
-6. MTUを超える場合はIPv6 Fragment Headerを付け、8-byte境界で分割する。
+5. パスMTU以内ならNext Header 97で送信する。
+6. パスMTUを超える場合はIPv6 Fragment Headerを付け、8-byte境界で分割する。
 
 WANからLAN方向:
 
 1. 宛先・送信元IPv6が設定と一致するパケットだけを受け付ける。複数トンネル
    モードでは送信元IPv6でトンネルを特定する。
-2. 必要ならfragmentを再構成する。
+2. 自アドレス宛のICMPv6 Packet Too BigはパスMTUの更新に使い、転送しない。
+3. 必要ならfragmentを再構成する。
 3. EtherIP version 3かつreserved bitsが0であることを検証する。
 4. 内側Ethernetフレームの送信元MACを学習する（トンネルごと）。
 5. 複数トンネルモードでは対応するVLANタグを付与する。
@@ -264,7 +292,9 @@ RFC 3378自体にはhop countやループ防止機構がありません。複数
 - IPv6拡張ヘッダーは、IPv6ヘッダー直後のFragment Headerだけに対応します。
 - 複数トンネルモードではLANフレームのVLAN IDでトンネルを選択し、タグを外して
   転送します。VLAN IDは12bitのVIDだけを判定し、PCP/DEIは設定・保存しません。
-- next hopのNDP探索、IPv6 routing、Path MTU Discovery、NDP以外のICMPv6生成は実装していません。
+- next hopのNDP探索、IPv6 routing、NDP以外のICMPv6生成（PTB受信処理は除く）は実装していません。
+- PMTUDは受信したPacket Too BigでパスMTUを引き下げるだけです。再上昇の再検証や、
+  LAN側ホストへのPacket Too Big送信は行いません。
 - fragment再構成は最大1024パケット、1パケット最大128 fragmentに制限しています。
 - DPDKポートはpromiscuous modeで動作します。
 

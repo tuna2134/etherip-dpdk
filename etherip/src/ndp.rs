@@ -90,3 +90,38 @@ pub fn icmpv6_checksum(source: &[u8; 16], destination: &[u8; 16], message: &[u8]
     }
     !(sum as u16)
 }
+
+/// Parses an ICMPv6 Packet Too Big addressed to `local_ipv6` and returns the
+/// reported MTU plus the destination of the embedded offending packet, which
+/// identifies the tunnel whose path MTU must be reduced.
+pub fn icmpv6_packet_too_big(packet: &[u8], local_ipv6: Ipv6Addr) -> Option<(u32, Ipv6Addr)> {
+    const ICMP_OFFSET: usize = 54;
+    if packet.len() < 102
+        || u16::from_be_bytes(packet[12..14].try_into().ok()?) != ETHER_TYPE_IPV6
+        || packet[14] >> 4 != 6
+        || packet[20] != NEXT_ICMPV6
+        || packet[38..54] != local_ipv6.octets()
+    {
+        return None;
+    }
+    let payload_length = u16::from_be_bytes(packet[18..20].try_into().ok()?) as usize;
+    if payload_length < 8 + 40 || packet.len() < ICMP_OFFSET + payload_length {
+        return None;
+    }
+    if packet[54] != 2 || packet[55] != 0 {
+        return None;
+    }
+    let source: [u8; 16] = packet[22..38].try_into().ok()?;
+    let destination: [u8; 16] = packet[38..54].try_into().ok()?;
+    let message = &packet[ICMP_OFFSET..ICMP_OFFSET + payload_length];
+    if icmpv6_checksum(&source, &destination, message) != 0 {
+        return None;
+    }
+    // The offending packet is embedded after the ICMPv6 header (offset 62).
+    if packet[62] >> 4 != 6 {
+        return None;
+    }
+    let mtu = u32::from_be_bytes(packet[58..62].try_into().ok()?);
+    let embedded_destination: [u8; 16] = packet[86..102].try_into().ok()?;
+    Some((mtu, Ipv6Addr::from(embedded_destination)))
+}

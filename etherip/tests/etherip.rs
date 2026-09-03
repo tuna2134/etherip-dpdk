@@ -5,10 +5,11 @@ use etherip::etherip::{
     valid_outer_packet, vlan_id,
 };
 use etherip::mac_table::MacTable;
-use etherip::ndp::{icmpv6_checksum, ndp_advertisement};
+use etherip::ndp::{icmpv6_checksum, icmpv6_packet_too_big, ndp_advertisement};
 use etherip::protocol::{ETHER_TYPE_IPV6, NEXT_ETHERIP, NEXT_ICMPV6};
 use etherip::reassembly::Reassembly;
 use std::net::Ipv6Addr;
+use std::sync::atomic::AtomicU32;
 
 fn config(mtu: usize) -> Config {
     Config {
@@ -25,6 +26,7 @@ fn config(mtu: usize) -> Config {
         tx_descriptors: 1024,
         socket_id: None,
         burst_size: 32,
+        workers: 1,
     }
 }
 
@@ -71,7 +73,8 @@ fn fragmented_round_trip() {
     let config = config(1280);
     let t = tunnel(&config);
     let frame = vec![0xa5; 2000];
-    let packets = fragment_packets(&frame, &t, [4; 6], &mut 0).unwrap();
+    let id = AtomicU32::new(0);
+    let packets = fragment_packets(&frame, &t, t.mtu, [4; 6], &id).unwrap();
     let reverse = tunnel(&Config {
         local_ipv6: config.remote_ipv6.unwrap(),
         remote_ipv6: Some(config.local_ipv6),
@@ -163,6 +166,36 @@ fn answers_neighbor_solicitation_for_local_wan_address() {
     assert_eq!(reply[58], 0x60);
     assert_eq!(icmpv6_checksum(&target, &source_ip, &reply[54..]), 0);
     assert_eq!(&reply[80..86], &local_mac);
+}
+
+#[test]
+fn parses_packet_too_big_for_tunnel() {
+    let config = config(1500);
+    let local = config.local_ipv6;
+    let remote = config.remote_ipv6.unwrap();
+    let router: [u8; 16] = [4; 16];
+    let mut packet = vec![0u8; 102];
+    packet[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
+    packet[14] = 0x60;
+    packet[18..20].copy_from_slice(&48u16.to_be_bytes());
+    packet[20] = NEXT_ICMPV6;
+    packet[21] = 64;
+    packet[22..38].copy_from_slice(&router);
+    packet[38..54].copy_from_slice(&local.octets());
+    packet[54] = 2; // Packet Too Big
+    packet[58..62].copy_from_slice(&1280u32.to_be_bytes());
+    // The embedded offending packet is the one we sent: src = local, dst = remote.
+    packet[62] = 0x60;
+    packet[68] = NEXT_ETHERIP;
+    packet[70..86].copy_from_slice(&local.octets());
+    packet[86..102].copy_from_slice(&remote.octets());
+    let checksum = icmpv6_checksum(&router, &local.octets(), &packet[54..]);
+    packet[56..58].copy_from_slice(&checksum.to_be_bytes());
+
+    let (mtu, destination) = icmpv6_packet_too_big(&packet, local).unwrap();
+    assert_eq!(mtu, 1280);
+    assert_eq!(destination, remote);
+    assert!(icmpv6_packet_too_big(&packet, remote).is_none());
 }
 
 #[test]
